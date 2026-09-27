@@ -8,14 +8,14 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from buffer import create_post, BufferError
 from db import read_state, write_state
 
-API_BASE       = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
-API_KEY        = os.getenv("API_KEY", "")
-BUFFER_SERVICE = os.getenv("BUFFER_SERVICE", "http://127.0.0.1:3000")
-MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "3"))
-POST_RETRIES   = int(os.getenv("BUFFER_RETRY_MAX", "3"))
-POST_BACKOFF   = float(os.getenv("BUFFER_RETRY_DELAY", "10"))
+API_BASE     = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
+API_KEY      = os.getenv("API_KEY", "")
+MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))
+POST_RETRIES = int(os.getenv("BUFFER_RETRY_MAX", "3"))
+POST_BACKOFF = float(os.getenv("BUFFER_RETRY_DELAY", "10"))
 
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
@@ -23,8 +23,8 @@ UTC     = ZoneInfo("UTC")
 # ==================================================================
 # Posting window (Nairobi local time)
 # ==================================================================
-WINDOW_START  = (6, 0)
-WINDOW_END    = (23, 0)
+WINDOW_START  = (6, 0)    # 6:00 AM
+WINDOW_END    = (23, 0)   # 11:00 PM
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120
 
@@ -49,22 +49,16 @@ def _default_state() -> dict:
 
 
 def load_state() -> dict:
-    """Synchronous accessor for the in-memory cache."""
     return _STATE
 
 
 def save_state(state: dict) -> None:
-    """
-    Update the in-memory cache and schedule a DB write.
-    Safe to call from sync code; the write is fire-and-forget.
-    """
     global _STATE
     _STATE = state
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_flush_state(state))
     except RuntimeError:
-        # No running loop — happens at import time; skip.
         pass
 
 
@@ -77,7 +71,6 @@ async def _flush_state(state: dict) -> None:
 
 
 async def load_state_from_db() -> dict:
-    """Load the state from Postgres into the in-memory cache."""
     global _STATE
     try:
         data = await read_state()
@@ -97,7 +90,6 @@ async def load_state_from_db() -> dict:
 
 
 async def persist_now() -> None:
-    """Force a synchronous flush (used by endpoints that must be durable)."""
     await _flush_state(_STATE)
 
 
@@ -105,8 +97,7 @@ async def persist_now() -> None:
 # Time helpers
 # ==================================================================
 def fmt_12h(dt: datetime) -> str:
-    s = dt.astimezone(NAIROBI).strftime("%I:%M %p")
-    return s.lstrip("0")
+    return dt.astimezone(NAIROBI).strftime("%I:%M %p").lstrip("0")
 
 
 def _hhmm_to_12h(hhmm: str) -> str:
@@ -143,11 +134,6 @@ def _today_local_str() -> str:
 def get_buffer_key() -> str:
     s = _STATE
     return (s.get("buffer_api_key") or os.getenv("BUFFER_API_KEY", "")).strip()
-
-
-def buffer_headers() -> dict:
-    key = get_buffer_key()
-    return {"X-Buffer-Key": key} if key else {}
 
 
 # ==================================================================
@@ -315,30 +301,28 @@ async def resolve(client, url, log) -> dict | None:
 async def post(video_url: str, source_url: str,
                channel_id: str, template: str, log) -> bool:
     text = template.replace("{source_url}", source_url).strip()[:2200]
+    key = get_buffer_key()
 
-    payload = {
-        "channelId": channel_id,
-        "text": text,
-        "videoUrls": [video_url],
-        "mode": "shareNow",
-    }
+    if not key:
+        log("❌ no Buffer API key — set it in ⚙ Settings")
+        return False
 
-    headers = {"Content-Type": "application/json", **buffer_headers()}
     log(f"🎬 TikTok video URL: {video_url[:90]}...")
 
     for attempt in range(1, POST_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=120) as c:
-                r = await c.post(
-                    f"{BUFFER_SERVICE}/api/posts",
-                    json=payload, headers=headers,
-                )
-            body = r.json()
-            if r.status_code == 200 and body.get("post"):
-                p = body["post"]
-                log(f"✅ published id={p.get('id', '?')[:8]}... status={p.get('status')}")
-                return True
-            log(f"⚠ post {attempt}/{POST_RETRIES}: {body.get('error') or r.text[:120]}")
+            result = await create_post(
+                key=key,
+                channel_id=channel_id,
+                text=text,
+                video_url=video_url,
+                mode="shareNow",
+            )
+            pid = (result.get("id") or "?")[:8]
+            log(f"✅ published id={pid}... status={result.get('status')}")
+            return True
+        except BufferError as e:
+            log(f"⚠ post {attempt}/{POST_RETRIES}: {e}")
         except Exception as e:
             log(f"⚠ post {attempt}/{POST_RETRIES}: {e}")
         if attempt < POST_RETRIES:
@@ -532,7 +516,7 @@ def is_running(pid: str) -> bool:
 
 
 # ==================================================================
-# Background re-roll
+# Background daily re-roll
 # ==================================================================
 async def daily_reroll_loop():
     print("[slots] background reroll loop started", flush=True)

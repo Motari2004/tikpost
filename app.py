@@ -6,40 +6,32 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+from buffer import key_check, list_tiktok_channels, BufferError
 from db import init_pool, close_pool
 from worker import (
     load_state, save_state, find_pipeline, update_pipeline,
     start_pipeline, stop_pipeline, is_running,
     upcoming_slots, ensure_slots_for_today, reroll_slots_today,
-    daily_reroll_loop, buffer_headers, get_buffer_key,
+    daily_reroll_loop, get_buffer_key,
     load_state_from_db, persist_now,
     _today_local_str,
     WINDOW_START, WINDOW_END, POSTS_PER_DAY, MIN_GAP_MIN,
 )
 
-BUFFER_SERVICE = os.getenv("BUFFER_SERVICE", "http://127.0.0.1:3000")
-CRON_SECRET    = os.getenv("CRON_SECRET", "").strip()
-MIGRATE_JSON   = os.getenv("MIGRATE_STATE_JSON", "1") == "1"
+CRON_SECRET  = os.getenv("CRON_SECRET", "").strip()
+MIGRATE_JSON = os.getenv("MIGRATE_STATE_JSON", "1") == "1"
 
 
-# ------------------------------------------------------------------
-# Lifespan — connect to Postgres, hydrate cache, start background loop
-# ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Connect to Postgres
     await init_pool()
-
-    # 2. Load state into the in-memory cache
     await load_state_from_db()
 
-    # 3. Optional one-shot migration from the old state.json
     if MIGRATE_JSON:
         legacy = Path("data/state.json")
         if legacy.exists() and not load_state().get("pipelines"):
@@ -53,11 +45,9 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"[db] migration failed: {e}", flush=True)
 
-    # 4. Ensure today's slots exist
     ensure_slots_for_today()
     await persist_now()
 
-    # 5. Start background re-roll loop
     task = asyncio.create_task(daily_reroll_loop())
 
     try:
@@ -73,10 +63,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="tikpost", lifespan=lifespan)
 
-
-# ------------------------------------------------------------------
-# CORS — Vercel frontend + local dev
-# ------------------------------------------------------------------
 _origins_env = os.getenv("CORS_ORIGINS", "").strip()
 allow_origins = (
     [o.strip() for o in _origins_env.split(",") if o.strip()]
@@ -97,13 +83,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 TEMPLATES = Path(__file__).parent / "templates"
 
 
-# ------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------
 class PipelineInput(BaseModel):
     name: str
     channel_id: str
@@ -115,9 +97,6 @@ class BufferKeyInput(BaseModel):
     api_key: str
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
 def _check_cron_secret(request: Request):
     if not CRON_SECRET:
         return
@@ -129,9 +108,6 @@ def _check_cron_secret(request: Request):
         raise HTTPException(status_code=401, detail="invalid cron secret")
 
 
-# ------------------------------------------------------------------
-# UI + health
-# ------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     idx = TEMPLATES / "index.html"
@@ -148,9 +124,6 @@ async def healthz():
     return {"ok": True}
 
 
-# ------------------------------------------------------------------
-# Status
-# ------------------------------------------------------------------
 @app.get("/api/status")
 async def status():
     s = load_state()
@@ -178,16 +151,9 @@ async def status():
     }
 
 
-# ------------------------------------------------------------------
-# External cron
-# ------------------------------------------------------------------
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
 async def cron_daily_roll(request: Request):
-    """
-    Idempotent endpoint for external cron (cron-job.org).
-    Rolls today's slots only if not already rolled.
-    """
     _check_cron_secret(request)
 
     st = load_state()
@@ -204,7 +170,6 @@ async def cron_daily_roll(request: Request):
 
     s = reroll_slots_today()
 
-    # Refresh upcoming_slots on all pipelines
     st = load_state()
     for p in st["pipelines"]:
         p["upcoming_slots"] = upcoming_slots(min(10, len(p.get("urls") or []) * 2))
@@ -222,9 +187,6 @@ async def cron_daily_roll(request: Request):
     }
 
 
-# ------------------------------------------------------------------
-# Settings (Buffer API key)
-# ------------------------------------------------------------------
 @app.get("/api/settings")
 async def get_settings():
     key = get_buffer_key()
@@ -241,17 +203,9 @@ async def set_buffer_key(data: BufferKeyInput):
         return JSONResponse({"ok": False, "error": "empty key"}, status_code=400)
 
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                f"{BUFFER_SERVICE}/api/key-check",
-                headers={"X-Buffer-Key": key},
-            )
-        body = r.json()
-        if not body.get("ok"):
-            return JSONResponse(
-                {"ok": False, "error": body.get("error", "invalid key")},
-                status_code=400,
-            )
+        email = await key_check(key)
+    except BufferError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -259,7 +213,7 @@ async def set_buffer_key(data: BufferKeyInput):
     s["buffer_api_key"] = key
     save_state(s)
     await persist_now()
-    return {"ok": True, "email": body.get("email")}
+    return {"ok": True, "email": email}
 
 
 @app.delete("/api/settings/buffer-key")
@@ -271,9 +225,6 @@ async def clear_buffer_key():
     return {"ok": True}
 
 
-# ------------------------------------------------------------------
-# Slots
-# ------------------------------------------------------------------
 @app.get("/api/slots")
 async def slots(count: int = 10):
     return {"slots": upcoming_slots(count)}
@@ -302,9 +253,6 @@ async def slots_reroll():
     return {"ok": True, "slots": s}
 
 
-# ------------------------------------------------------------------
-# Pipelines
-# ------------------------------------------------------------------
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     s = load_state()
@@ -389,25 +337,20 @@ async def pipeline_reset(pid: str):
     return {"ok": True}
 
 
-# ------------------------------------------------------------------
-# Channels proxy
-# ------------------------------------------------------------------
 @app.get("/api/channels")
 async def channels():
+    key = get_buffer_key()
+    if not key:
+        return JSONResponse({"error": "No Buffer API key set"}, status_code=400)
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(
-                f"{BUFFER_SERVICE}/api/channels",
-                headers=buffer_headers(),
-            )
-        return JSONResponse(r.json(), status_code=r.status_code)
+        data = await list_tiktok_channels(key)
+        return JSONResponse(data)
+    except BufferError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# ------------------------------------------------------------------
-# JSON upload
-# ------------------------------------------------------------------
 @app.post("/api/upload")
 async def upload_json(file: UploadFile = File(...)):
     import json as _json
@@ -429,9 +372,6 @@ async def upload_json(file: UploadFile = File(...)):
     return {"ok": True, "urls": urls, "count": len(urls)}
 
 
-# ------------------------------------------------------------------
-# Local dev
-# ------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))

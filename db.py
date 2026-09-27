@@ -9,7 +9,6 @@ _pool: asyncpg.Pool | None = None
 
 
 async def init_pool():
-    """Create the connection pool and ensure the schema exists."""
     global _pool
     if _pool is not None:
         return _pool
@@ -32,7 +31,6 @@ async def init_pool():
                 updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-        # Ensure the singleton row exists
         await conn.execute("""
             INSERT INTO app_state (id, data)
             VALUES (1, '{}'::jsonb)
@@ -44,7 +42,7 @@ async def init_pool():
 
 def get_pool() -> asyncpg.Pool:
     if _pool is None:
-        raise RuntimeError("DB pool not initialized — call init_pool() first")
+        raise RuntimeError("DB pool not initialized")
     return _pool
 
 
@@ -56,7 +54,6 @@ async def close_pool():
 
 
 async def read_state() -> dict:
-    """Return the app state as a dict."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT data FROM app_state WHERE id = 1")
@@ -67,7 +64,6 @@ async def read_state() -> dict:
 
 
 async def write_state(state: dict) -> None:
-    """Overwrite the singleton state row."""
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
