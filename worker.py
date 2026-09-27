@@ -24,8 +24,8 @@ STATE_FILE = ROOT / "state.json"
 # ==================================================================
 # Posting window (Nairobi local time)
 # ==================================================================
-WINDOW_START  = (6, 0)    # 06:00
-WINDOW_END    = (23, 0)   # 23:00
+WINDOW_START  = (6, 0)    # 6:00 AM
+WINDOW_END    = (23, 0)   # 11:00 PM
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120       # minimum minutes between the daily slots
 
@@ -34,20 +34,11 @@ MIN_GAP_MIN   = 120       # minimum minutes between the daily slots
 # Time helpers
 # ==================================================================
 def fmt_12h(dt: datetime) -> str:
-    """Format a datetime as 12-hour AM/PM, e.g. '7:43 AM'."""
-    return dt.astimezone(NAIROBI).strftime("%-I:%M %p")
-
-
-def fmt_12h_win(dt: datetime) -> str:
-    """Windows-safe version of fmt_12h (no %-I)."""
     s = dt.astimezone(NAIROBI).strftime("%I:%M %p")
-    if s.startswith("0"):
-        s = s[1:]
-    return s
+    return s.lstrip("0")
 
 
 def _hhmm_to_12h(hhmm: str) -> str:
-    """'07:43' → '7:43 AM'."""
     h, m = hhmm.split(":")
     h = int(h)
     suffix = "AM" if h < 12 else "PM"
@@ -71,11 +62,23 @@ def _minutes(h: int, m: int) -> int:
     return h * 60 + m
 
 
+# ==================================================================
+# Buffer key helpers
+# ==================================================================
+def get_buffer_key() -> str:
+    s = load_state()
+    return (s.get("buffer_api_key") or os.getenv("BUFFER_API_KEY", "")).strip()
+
+
+def buffer_headers() -> dict:
+    key = get_buffer_key()
+    return {"X-Buffer-Key": key} if key else {}
+
+
+# ==================================================================
+# Random daily slots
+# ==================================================================
 def _roll_slots_for(day) -> list[str]:
-    """
-    Generate POSTS_PER_DAY random Nairobi-local 'HH:MM' strings inside
-    the window, with a minimum gap. Returns a sorted list.
-    """
     start_min = _minutes(*WINDOW_START)
     end_min   = _minutes(*WINDOW_END)
     span      = end_min - start_min
@@ -104,15 +107,11 @@ def _roll_slots_for(day) -> list[str]:
     return sorted(out)
 
 
-# ==================================================================
-# Daily slots (persistent)
-# ==================================================================
 def _today_local_str() -> str:
     return now_utc().astimezone(NAIROBI).date().isoformat()
 
 
 def ensure_slots_for_today() -> dict:
-    """Ensure state['slots'] has a fresh roll for today. Persist."""
     s = load_state()
     slots = s.setdefault("slots", {"day": None, "times": []})
     today = _today_local_str()
@@ -129,7 +128,6 @@ def ensure_slots_for_today() -> dict:
 
 
 def reroll_slots_today() -> dict:
-    """Force a new random roll for today."""
     s = load_state()
     slots = s.setdefault("slots", {})
     today = _today_local_str()
@@ -152,7 +150,6 @@ def today_slots_utc() -> list[datetime]:
 
 
 def daily_slots_for(day) -> list[datetime]:
-    """Return slots for a given local date, in UTC."""
     today_local = now_utc().astimezone(NAIROBI).date()
     if day == today_local:
         return today_slots_utc()
@@ -194,8 +191,8 @@ def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
         out.append({
             "utc": utc_iso(s),
             "nairobi": nairobi_iso(s),
-            "label": local.strftime("%a %d %b") + " · " + fmt_12h_win(local),
-            "time12": fmt_12h_win(local),
+            "label": local.strftime("%a %d %b") + " · " + fmt_12h(local),
+            "time12": fmt_12h(local),
         })
         cursor = s + timedelta(seconds=1)
     return out
@@ -210,7 +207,11 @@ def load_state() -> dict:
         s.setdefault("pipelines", [])
         s.setdefault("slots", {"day": None, "times": []})
         return s
-    return {"pipelines": [], "slots": {"day": None, "times": []}}
+    return {
+        "pipelines": [],
+        "slots": {"day": None, "times": []},
+        "buffer_api_key": "",
+    }
 
 
 def save_state(s: dict) -> None:
@@ -268,12 +269,17 @@ async def post(video_url: str, source_url: str,
         "mode": "shareNow",
     }
 
+    headers = {"Content-Type": "application/json", **buffer_headers()}
     log(f"🎬 TikTok video URL: {video_url[:90]}...")
 
     for attempt in range(1, POST_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=120) as c:
-                r = await c.post(f"{BUFFER_SERVICE}/api/posts", json=payload)
+                r = await c.post(
+                    f"{BUFFER_SERVICE}/api/posts",
+                    json=payload,
+                    headers=headers,
+                )
             body = r.json()
             if r.status_code == 200 and body.get("post"):
                 p = body["post"]
@@ -288,10 +294,9 @@ async def post(video_url: str, source_url: str,
 
 
 # ==================================================================
-# Daily re-roll trigger
+# Daily re-roll
 # ==================================================================
 async def daily_reroll_loop():
-    """Background task: at each Nairobi midnight, roll new slots."""
     print("[slots] daily reroll task started", flush=True)
     try:
         ensure_slots_for_today()
@@ -338,7 +343,7 @@ class PipelineRunner:
         self.next_slot: str | None = None
 
     def log(self, msg: str):
-        line = f"{datetime.now(NAIROBI).strftime('%I:%M:%S %p')} {msg}".lstrip("0")
+        line = f"{datetime.now(NAIROBI).strftime('%I:%M:%S %p').lstrip('0')} {msg}"
         print(f"[{self.pid[:8]}] {line}", flush=True)
         s = load_state()
         for p in s["pipelines"]:
@@ -374,16 +379,17 @@ class PipelineRunner:
             self.log("❌ no URLs in pipeline")
             update_pipeline(self.pid, status="failed")
             return
+        if not get_buffer_key():
+            self.log("❌ no Buffer API key — set it in ⚙ Settings")
+            update_pipeline(self.pid, status="failed")
+            return
 
         ensure_slots_for_today()
         slots_today = load_state()["slots"]["times"]
         pretty_slots = ", ".join(_hhmm_to_12h(t) for t in slots_today)
 
-        win_start = f"{WINDOW_START[0] % 12 or 12}:{WINDOW_START[1]:02d} AM"
-        win_end_h = WINDOW_END[0]
-        win_end_suffix = "AM" if win_end_h < 12 else "PM"
-        win_end_12 = win_end_h % 12 or 12
-        win_end = f"{win_end_12}:{WINDOW_END[1]:02d} {win_end_suffix}"
+        win_start = _hhmm_to_12h(f"{WINDOW_START[0]:02d}:{WINDOW_START[1]:02d}")
+        win_end   = _hhmm_to_12h(f"{WINDOW_END[0]:02d}:{WINDOW_END[1]:02d}")
 
         self.log(
             f"🗓 window {win_start}–{win_end} (Nairobi) · "
@@ -404,7 +410,7 @@ class PipelineRunner:
             while slot_index < len(urls) and not self.cancel:
                 slot_time = next_slot_after(now_utc())
                 nairobi_time = slot_time.astimezone(NAIROBI)
-                nai_12h = fmt_12h_win(nairobi_time)
+                nai_12h = fmt_12h(nairobi_time)
 
                 self.next_slot = utc_iso(slot_time)
                 update_pipeline(

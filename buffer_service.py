@@ -1,24 +1,30 @@
-import os
-import requests
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+import os, requests
 
 load_dotenv()
 
-app = Flask(__name__, static_folder="public", static_url_path="")
+app = Flask(__name__)
 CORS(app)
 
 BUFFER_API = "https://api.buffer.com"
 
 
-# ------------------------------------------------------------------
-# Buffer GraphQL helper
-# ------------------------------------------------------------------
+def _current_key() -> str:
+    """Prefer the key sent by the caller; fall back to the env var."""
+    return (request.headers.get("X-Buffer-Key")
+            or os.getenv("BUFFER_API_KEY", "")).strip()
+
+
 def buffer(query, variables=None):
+    key = _current_key()
+    if not key:
+        raise Exception("No Buffer API key configured (set it in the UI or env)")
+
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.getenv('BUFFER_API_KEY')}",
+        "Authorization": f"Bearer {key}",
     }
     payload = {"query": query, "variables": variables or {}}
 
@@ -31,20 +37,29 @@ def buffer(query, variables=None):
         raise Exception(f"Buffer returned non-JSON: {res.text[:200]}")
 
     if "errors" in json_data:
-        messages = "; ".join(
-            e.get("message", "Unknown error") for e in json_data["errors"]
-        )
+        messages = "; ".join(e.get("message", "Unknown error") for e in json_data["errors"])
         raise Exception(messages)
 
     return json_data.get("data", {})
 
 
 # ------------------------------------------------------------------
-# Health
+# Health & key check
 # ------------------------------------------------------------------
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"ok": True})
+
+
+@app.route("/api/key-check", methods=["POST"])
+def key_check():
+    """Validate the supplied key by hitting Buffer's account query."""
+    try:
+        data = buffer("query { account { id email } }")
+        account = data.get("account") or {}
+        return jsonify({"ok": True, "email": account.get("email")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 # ------------------------------------------------------------------
@@ -53,14 +68,7 @@ def healthz():
 @app.route("/api/channels", methods=["GET"])
 def get_channels():
     try:
-        data = buffer("""
-            query {
-              account {
-                organizations { id name }
-              }
-            }
-        """)
-
+        data = buffer("query { account { organizations { id name } } }")
         orgs = (data.get("account") or {}).get("organizations") or []
         all_channels = []
 
@@ -69,12 +77,7 @@ def get_channels():
                 """
                 query GetChannels($input: ChannelsInput!) {
                   channels(input: $input) {
-                    id
-                    name
-                    service
-                    avatar
-                    displayName
-                    isDisconnected
+                    id name service avatar displayName isDisconnected
                   }
                 }
                 """,
@@ -87,12 +90,7 @@ def get_channels():
             c for c in all_channels
             if c.get("service") == "tiktok" and not c.get("isDisconnected")
         ]
-
-        return jsonify({
-            "channels": tiktok,
-            "tiktok": tiktok,
-            "all": all_channels,
-        })
+        return jsonify({"channels": tiktok, "tiktok": tiktok, "all": all_channels})
 
     except Exception as e:
         print(f"[channels] error: {e}", flush=True)
@@ -132,10 +130,7 @@ def create_post():
                 except (ValueError, TypeError):
                     offset_val = 1000
                 assets.append({
-                    "video": {
-                        "url": url,
-                        "metadata": {"thumbnailOffset": offset_val}
-                    }
+                    "video": {"url": url, "metadata": {"thumbnailOffset": offset_val}}
                 })
 
         post_input = {
@@ -152,83 +147,25 @@ def create_post():
             """
             mutation CreatePost($input: CreatePostInput!) {
               createPost(input: $input) {
-                ... on PostActionSuccess {
-                  post { id text status dueAt shareMode externalLink }
-                }
+                ... on PostActionSuccess { post { id text status dueAt shareMode externalLink } }
                 ... on MutationError { message }
               }
             }
             """,
             {"input": post_input},
         )
-
         result = data.get("createPost") or {}
         if result.get("message"):
             raise Exception(result["message"])
-
-        post = result.get("post")
-        print(
-            f"[posts] tiktok id={post.get('id') if post else '?'} "
-            f"status={post.get('status') if post else '?'}",
-            flush=True,
-        )
-        return jsonify({"post": post})
+        return jsonify({"post": result.get("post")})
 
     except Exception as e:
         print(f"[posts] error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ------------------------------------------------------------------
-# GET recent posts
-# ------------------------------------------------------------------
-@app.route("/api/posts/<channel_id>", methods=["GET"])
-def get_posts(channel_id):
-    try:
-        orgs = buffer("""
-            query { account { organizations { id } } }
-        """)
-        orgs_list = (orgs.get("account") or {}).get("organizations") or []
-        if not orgs_list:
-            raise Exception("No organization found")
-
-        organization_id = orgs_list[0]["id"]
-
-        data = buffer(
-            """
-            query Posts($input: PostsInput!) {
-              posts(input: $input) {
-                edges {
-                  node { id text status dueAt shareMode }
-                }
-              }
-            }
-            """,
-            {
-                "input": {
-                    "organizationId": organization_id,
-                    "filter": {"channelIds": [channel_id]},
-                }
-            },
-        )
-
-        edges = (data.get("posts") or {}).get("edges") or []
-        return jsonify({"posts": [e["node"] for e in edges]})
-
-    except Exception as e:
-        print(f"[posts/{channel_id}] error: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-
-# ------------------------------------------------------------------
-# Run
-# ------------------------------------------------------------------
 if __name__ == "__main__":
-    if not os.getenv("BUFFER_API_KEY"):
-        print("⚠ WARNING: BUFFER_API_KEY not set in environment", flush=True)
-
     port = int(os.getenv("PORT", os.getenv("BUFFER_PORT", "3000")))
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
-
     print(f"[buffer_service] starting on http://0.0.0.0:{port}", flush=True)
     app.run(host="0.0.0.0", port=port, debug=debug)

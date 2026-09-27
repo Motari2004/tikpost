@@ -14,16 +14,13 @@ from worker import (
     load_state, save_state, find_pipeline, update_pipeline,
     start_pipeline, stop_pipeline, is_running,
     upcoming_slots, ensure_slots_for_today, reroll_slots_today,
-    daily_reroll_loop,
+    daily_reroll_loop, buffer_headers, get_buffer_key,
     WINDOW_START, WINDOW_END, POSTS_PER_DAY, MIN_GAP_MIN,
 )
 
 BUFFER_SERVICE = os.getenv("BUFFER_SERVICE", "http://127.0.0.1:3000")
 
 
-# ------------------------------------------------------------------
-# Lifespan: start the daily re-roll background task
-# ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_slots_for_today()
@@ -50,6 +47,10 @@ class PipelineInput(BaseModel):
     channel_id: str
     tweet_template: str
     urls: list[str]
+
+
+class BufferKeyInput(BaseModel):
+    api_key: str
 
 
 # ------------------------------------------------------------------
@@ -91,7 +92,54 @@ async def status():
 
 
 # ------------------------------------------------------------------
-# Slot preview & re-roll
+# Settings
+# ------------------------------------------------------------------
+@app.get("/api/settings")
+async def get_settings():
+    key = get_buffer_key()
+    return {
+        "has_key": bool(key),
+        "preview": (key[:6] + "…" + key[-4:]) if len(key) > 12 else ("set" if key else ""),
+    }
+
+
+@app.post("/api/settings/buffer-key")
+async def set_buffer_key(data: BufferKeyInput):
+    key = data.api_key.strip()
+    if not key:
+        return JSONResponse({"ok": False, "error": "empty key"}, status_code=400)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                f"{BUFFER_SERVICE}/api/key-check",
+                headers={"X-Buffer-Key": key},
+            )
+        body = r.json()
+        if not body.get("ok"):
+            return JSONResponse(
+                {"ok": False, "error": body.get("error", "invalid key")},
+                status_code=400,
+            )
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    s = load_state()
+    s["buffer_api_key"] = key
+    save_state(s)
+    return {"ok": True, "email": body.get("email")}
+
+
+@app.delete("/api/settings/buffer-key")
+async def clear_buffer_key():
+    s = load_state()
+    s.pop("buffer_api_key", None)
+    save_state(s)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# Slots
 # ------------------------------------------------------------------
 @app.get("/api/slots")
 async def slots(count: int = 10):
@@ -100,20 +148,20 @@ async def slots(count: int = 10):
 
 @app.get("/api/slots/today")
 async def slots_today():
-    from worker import today_slots_utc, utc_iso, nairobi_iso
+    from worker import today_slots_utc, utc_iso, nairobi_iso, fmt_12h
     out = []
     for s in today_slots_utc():
         out.append({
             "utc": utc_iso(s),
             "nairobi": nairobi_iso(s),
-            "label": s.astimezone(__import__("zoneinfo").ZoneInfo("Africa/Nairobi")).strftime("%a %d %b · %H:%M"),
+            "time12": fmt_12h(s),
+            "label": s.astimezone(__import__("zoneinfo").ZoneInfo("Africa/Nairobi")).strftime("%a %d %b") + " · " + fmt_12h(s),
         })
     return {"slots": out}
 
 
 @app.post("/api/slots/reroll")
 async def slots_reroll():
-    """Force a fresh random roll for today."""
     s = reroll_slots_today()
     return {"ok": True, "slots": s}
 
@@ -205,13 +253,16 @@ async def pipeline_reset(pid: str):
 
 
 # ------------------------------------------------------------------
-# Channels proxy (TikTok only)
+# Channels proxy
 # ------------------------------------------------------------------
 @app.get("/api/channels")
 async def channels():
     try:
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(f"{BUFFER_SERVICE}/api/channels")
+            r = await c.get(
+                f"{BUFFER_SERVICE}/api/channels",
+                headers=buffer_headers(),
+            )
         return JSONResponse(r.json(), status_code=r.status_code)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
