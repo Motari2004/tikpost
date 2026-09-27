@@ -23,7 +23,7 @@ def buffer(query, variables=None):
     payload = {"query": query, "variables": variables or {}}
 
     res = requests.post(BUFFER_API, json=payload, headers=headers, timeout=60)
-    print(f"[Buffer] status={res.status_code} body={res.text[:400]}")
+    print(f"[Buffer] status={res.status_code} body={res.text[:400]}", flush=True)
 
     try:
         json_data = res.json()
@@ -95,7 +95,7 @@ def get_channels():
         })
 
     except Exception as e:
-        print(f"[channels] error: {e}")
+        print(f"[channels] error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -167,12 +167,15 @@ def create_post():
             raise Exception(result["message"])
 
         post = result.get("post")
-        print(f"[posts] tiktok id={post.get('id') if post else '?'} "
-              f"status={post.get('status') if post else '?'}")
+        print(
+            f"[posts] tiktok id={post.get('id') if post else '?'} "
+            f"status={post.get('status') if post else '?'}",
+            flush=True,
+        )
         return jsonify({"post": post})
 
     except Exception as e:
-        print(f"[posts] error: {e}")
+        print(f"[posts] error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -213,15 +216,19 @@ def get_posts(channel_id):
         return jsonify({"posts": [e["node"] for e in edges]})
 
     except Exception as e:
-        print(f"[posts/{channel_id}] error: {e}")
+        print(f"[posts/{channel_id}] error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------------------------------------------------------
+# Run
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     if not os.getenv("BUFFER_API_KEY"):
-        print("⚠ WARNING: BUFFER_API_KEY not set in .env file")
+        print("⚠ WARNING: BUFFER_API_KEY not set in environment", flush=True)
 
-    port = int(os.getenv("BUFFER_PORT", "3000"))
-    debug = os.getenv("FLASK_DEBUG", "1") == "1"
-    print(f"[buffer_service] starting on http://127.0.0.1:{port}")
-    app.run(host="127.0.0.1", port=port, debug=debug)
+    port = int(os.getenv("PORT", os.getenv("BUFFER_PORT", "3000")))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+
+    print(f"[buffer_service] starting on http://0.0.0.0:{port}", flush=True)
+    app.run(host="0.0.0.0", port=port, debug=debug)
