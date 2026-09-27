@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+httpx
+jinja2
+python-multipart
+flask
+flask-cors
+requests
+python-dotenv
+tzdata
