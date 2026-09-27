@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from db import read_state, write_state
+
 API_BASE       = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
 API_KEY        = os.getenv("API_KEY", "")
 BUFFER_SERVICE = os.getenv("BUFFER_SERVICE", "http://127.0.0.1:3000")
@@ -18,16 +20,85 @@ POST_BACKOFF   = float(os.getenv("BUFFER_RETRY_DELAY", "10"))
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
 
-ROOT       = Path(__file__).parent
-STATE_FILE = ROOT / "state.json"
-
 # ==================================================================
 # Posting window (Nairobi local time)
 # ==================================================================
-WINDOW_START  = (6, 0)    # 6:00 AM
-WINDOW_END    = (23, 0)   # 11:00 PM
+WINDOW_START  = (6, 0)
+WINDOW_END    = (23, 0)
 POSTS_PER_DAY = 2
-MIN_GAP_MIN   = 120       # minimum minutes between the daily slots
+MIN_GAP_MIN   = 120
+
+
+# ==================================================================
+# In-memory state cache
+# ==================================================================
+_STATE: dict = {
+    "pipelines": [],
+    "slots": {"day": None, "times": []},
+    "buffer_api_key": "",
+}
+_STATE_LOCK = asyncio.Lock()
+
+
+def _default_state() -> dict:
+    return {
+        "pipelines": [],
+        "slots": {"day": None, "times": []},
+        "buffer_api_key": "",
+    }
+
+
+def load_state() -> dict:
+    """Synchronous accessor for the in-memory cache."""
+    return _STATE
+
+
+def save_state(state: dict) -> None:
+    """
+    Update the in-memory cache and schedule a DB write.
+    Safe to call from sync code; the write is fire-and-forget.
+    """
+    global _STATE
+    _STATE = state
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_flush_state(state))
+    except RuntimeError:
+        # No running loop — happens at import time; skip.
+        pass
+
+
+async def _flush_state(state: dict) -> None:
+    async with _STATE_LOCK:
+        try:
+            await write_state(state)
+        except Exception as e:
+            print(f"[db] write_state failed: {e}", flush=True)
+
+
+async def load_state_from_db() -> dict:
+    """Load the state from Postgres into the in-memory cache."""
+    global _STATE
+    try:
+        data = await read_state()
+    except Exception as e:
+        print(f"[db] read_state failed: {e}", flush=True)
+        data = {}
+
+    if not data:
+        data = _default_state()
+
+    data.setdefault("pipelines", [])
+    data.setdefault("slots", {"day": None, "times": []})
+    data.setdefault("buffer_api_key", "")
+
+    _STATE = data
+    return _STATE
+
+
+async def persist_now() -> None:
+    """Force a synchronous flush (used by endpoints that must be durable)."""
+    await _flush_state(_STATE)
 
 
 # ==================================================================
@@ -62,11 +133,15 @@ def _minutes(h: int, m: int) -> int:
     return h * 60 + m
 
 
+def _today_local_str() -> str:
+    return now_utc().astimezone(NAIROBI).date().isoformat()
+
+
 # ==================================================================
-# Buffer key helpers
+# Buffer key
 # ==================================================================
 def get_buffer_key() -> str:
-    s = load_state()
+    s = _STATE
     return (s.get("buffer_api_key") or os.getenv("BUFFER_API_KEY", "")).strip()
 
 
@@ -107,12 +182,8 @@ def _roll_slots_for(day) -> list[str]:
     return sorted(out)
 
 
-def _today_local_str() -> str:
-    return now_utc().astimezone(NAIROBI).date().isoformat()
-
-
 def ensure_slots_for_today() -> dict:
-    s = load_state()
+    s = _STATE
     slots = s.setdefault("slots", {"day": None, "times": []})
     today = _today_local_str()
 
@@ -128,7 +199,7 @@ def ensure_slots_for_today() -> dict:
 
 
 def reroll_slots_today() -> dict:
-    s = load_state()
+    s = _STATE
     slots = s.setdefault("slots", {})
     today = _today_local_str()
     slots["day"] = today
@@ -199,35 +270,18 @@ def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
 
 
 # ==================================================================
-# State
+# Pipeline helpers
 # ==================================================================
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        s.setdefault("pipelines", [])
-        s.setdefault("slots", {"day": None, "times": []})
-        return s
-    return {
-        "pipelines": [],
-        "slots": {"day": None, "times": []},
-        "buffer_api_key": "",
-    }
-
-
-def save_state(s: dict) -> None:
-    STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
 def find_pipeline(pid: str) -> dict | None:
-    for p in load_state()["pipelines"]:
+    for p in _STATE.get("pipelines", []):
         if p["id"] == pid:
             return p
     return None
 
 
 def update_pipeline(pid: str, **fields) -> dict | None:
-    s = load_state()
-    for p in s["pipelines"]:
+    s = _STATE
+    for p in s.get("pipelines", []):
         if p["id"] == pid:
             p.update(fields)
             save_state(s)
@@ -277,8 +331,7 @@ async def post(video_url: str, source_url: str,
             async with httpx.AsyncClient(timeout=120) as c:
                 r = await c.post(
                     f"{BUFFER_SERVICE}/api/posts",
-                    json=payload,
-                    headers=headers,
+                    json=payload, headers=headers,
                 )
             body = r.json()
             if r.status_code == 200 and body.get("post"):
@@ -291,44 +344,6 @@ async def post(video_url: str, source_url: str,
         if attempt < POST_RETRIES:
             await asyncio.sleep(POST_BACKOFF * attempt)
     return False
-
-
-# ==================================================================
-# Daily re-roll
-# ==================================================================
-async def daily_reroll_loop():
-    print("[slots] daily reroll task started", flush=True)
-    try:
-        ensure_slots_for_today()
-    except Exception as e:
-        print(f"[slots] initial roll failed: {e}", flush=True)
-
-    while True:
-        try:
-            local_now = now_utc().astimezone(NAIROBI)
-            tomorrow = (local_now + timedelta(days=1)).date()
-            midnight = datetime(
-                tomorrow.year, tomorrow.month, tomorrow.day,
-                0, 0, 0, tzinfo=NAIROBI,
-            ).astimezone(UTC)
-
-            wait_sec = (midnight - now_utc()).total_seconds()
-            while wait_sec > 0:
-                await asyncio.sleep(min(60, wait_sec))
-                wait_sec = (midnight - now_utc()).total_seconds()
-
-            s = load_state()
-            day_str = now_utc().astimezone(NAIROBI).date().isoformat()
-            slots = s.setdefault("slots", {})
-            slots["day"] = day_str
-            slots["times"] = _roll_slots_for(now_utc().astimezone(NAIROBI).date())
-            slots["rolled_at"] = now_utc().isoformat()
-            save_state(s)
-            pretty = ", ".join(_hhmm_to_12h(t) for t in slots["times"])
-            print(f"[slots] rolled new slots for {day_str}: {pretty}", flush=True)
-        except Exception as e:
-            print(f"[slots] reroll loop error: {e}", flush=True)
-            await asyncio.sleep(60)
 
 
 # ==================================================================
@@ -345,8 +360,8 @@ class PipelineRunner:
     def log(self, msg: str):
         line = f"{datetime.now(NAIROBI).strftime('%I:%M:%S %p').lstrip('0')} {msg}"
         print(f"[{self.pid[:8]}] {line}", flush=True)
-        s = load_state()
-        for p in s["pipelines"]:
+        s = _STATE
+        for p in s.get("pipelines", []):
             if p["id"] == self.pid:
                 p.setdefault("log", []).append(line)
                 p["log"] = p["log"][-200:]
@@ -385,7 +400,7 @@ class PipelineRunner:
             return
 
         ensure_slots_for_today()
-        slots_today = load_state()["slots"]["times"]
+        slots_today = _STATE["slots"]["times"]
         pretty_slots = ", ".join(_hhmm_to_12h(t) for t in slots_today)
 
         win_start = _hhmm_to_12h(f"{WINDOW_START[0]:02d}:{WINDOW_START[1]:02d}")
@@ -514,3 +529,44 @@ def stop_pipeline(pid: str) -> bool:
 def is_running(pid: str) -> bool:
     r = runners.get(pid)
     return bool(r and r.task and not r.task.done())
+
+
+# ==================================================================
+# Background re-roll
+# ==================================================================
+async def daily_reroll_loop():
+    print("[slots] background reroll loop started", flush=True)
+    try:
+        ensure_slots_for_today()
+        await persist_now()
+    except Exception as e:
+        print(f"[slots] initial roll failed: {e}", flush=True)
+
+    while True:
+        try:
+            local_now = now_utc().astimezone(NAIROBI)
+            tomorrow = (local_now + timedelta(days=1)).date()
+            midnight = datetime(
+                tomorrow.year, tomorrow.month, tomorrow.day,
+                0, 0, 0, tzinfo=NAIROBI,
+            ).astimezone(UTC)
+
+            wait_sec = (midnight - now_utc()).total_seconds()
+            while wait_sec > 0:
+                await asyncio.sleep(min(60, wait_sec))
+                wait_sec = (midnight - now_utc()).total_seconds()
+
+            s = _STATE
+            day_str = _today_local_str()
+            slots = s.setdefault("slots", {})
+            if slots.get("day") != day_str or not slots.get("times"):
+                slots["day"] = day_str
+                slots["times"] = _roll_slots_for(now_utc().astimezone(NAIROBI).date())
+                slots["rolled_at"] = now_utc().isoformat()
+                save_state(s)
+                await persist_now()
+                pretty = ", ".join(_hhmm_to_12h(t) for t in slots["times"])
+                print(f"[slots] background rolled new slots for {day_str}: {pretty}", flush=True)
+        except Exception as e:
+            print(f"[slots] reroll loop error: {e}", flush=True)
+            await asyncio.sleep(60)
