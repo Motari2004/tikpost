@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -21,6 +22,9 @@ from worker import (
 BUFFER_SERVICE = os.getenv("BUFFER_SERVICE", "http://127.0.0.1:3000")
 
 
+# ------------------------------------------------------------------
+# Lifespan
+# ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_slots_for_today()
@@ -36,6 +40,34 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="tikpost", lifespan=lifespan)
+
+
+# ------------------------------------------------------------------
+# CORS — allow the Vercel frontend + local dev to call this API
+# ------------------------------------------------------------------
+_origins_env = os.getenv("CORS_ORIGINS", "").strip()
+if _origins_env:
+    allow_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
+else:
+    # Sensible defaults for dev + your Vercel deploy
+    allow_origins = [
+        "https://tikpost-murex.vercel.app",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",   # any *.vercel.app preview
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 TEMPLATES = Path(__file__).parent / "templates"
 
 
@@ -54,11 +86,25 @@ class BufferKeyInput(BaseModel):
 
 
 # ------------------------------------------------------------------
-# UI
+# UI (served locally; Vercel serves its own copy)
 # ------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return (TEMPLATES / "index.html").read_text(encoding="utf-8")
+    idx = TEMPLATES / "index.html"
+    if idx.exists():
+        return idx.read_text(encoding="utf-8")
+    return HTMLResponse(
+        "<h1>tikpost API</h1>"
+        "<p>Frontend is deployed on Vercel. This is the API backend.</p>"
+    )
+
+
+# ------------------------------------------------------------------
+# Health
+# ------------------------------------------------------------------
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------
@@ -149,13 +195,15 @@ async def slots(count: int = 10):
 @app.get("/api/slots/today")
 async def slots_today():
     from worker import today_slots_utc, utc_iso, nairobi_iso, fmt_12h
+    from zoneinfo import ZoneInfo
+    nai = ZoneInfo("Africa/Nairobi")
     out = []
     for s in today_slots_utc():
         out.append({
             "utc": utc_iso(s),
             "nairobi": nairobi_iso(s),
             "time12": fmt_12h(s),
-            "label": s.astimezone(__import__("zoneinfo").ZoneInfo("Africa/Nairobi")).strftime("%a %d %b") + " · " + fmt_12h(s),
+            "label": s.astimezone(nai).strftime("%a %d %b") + " · " + fmt_12h(s),
         })
     return {"slots": out}
 
@@ -297,4 +345,5 @@ async def upload_json(file: UploadFile = File(...)):
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
