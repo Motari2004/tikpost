@@ -24,7 +24,6 @@ WINDOW_END    = (23, 0)
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120
 
-# How long a "pending" pipeline can sit before we assume the work endpoint died
 PENDING_STALE_SEC = 300
 
 
@@ -360,7 +359,7 @@ async def post_to_buffer(state: dict, video_url: str, source_url: str,
 
 
 # ==================================================================
-# Due discovery — marks pipelines as "pending"
+# Due discovery — marks as pending
 # ==================================================================
 def find_due_pipelines(state: dict) -> list[str]:
     now = now_utc()
@@ -381,13 +380,11 @@ def find_due_pipelines(state: dict) -> list[str]:
         except Exception:
             continue
 
-        # A "running" pipeline stuck > 5 min → crashed. Reset.
         if status == "running" and due_at < stuck_before:
             p["status"] = "scheduled"
             p["current"] = None
             status = "scheduled"
 
-        # A "pending" pipeline stuck > 5 min → work died. Reset.
         if status == "pending" and due_at < pending_stale:
             p["status"] = "scheduled"
             p["current"] = None
@@ -397,14 +394,12 @@ def find_due_pipelines(state: dict) -> list[str]:
             p["status"] = "pending"
             p["pending_since"] = now.isoformat()
             due.append(p["id"])
-        elif due_at <= now and status == "pending":
-            due.append(p["id"])   # already marked
 
     return due
 
 
 # ==================================================================
-# Fire — the actual work
+# Fire — actual work
 # ==================================================================
 async def fire_one(state: dict, p: dict) -> dict:
     pid = p["id"]
@@ -428,7 +423,6 @@ async def fire_one(state: dict, p: dict) -> dict:
 
     log = lambda m: _log(state, pid, m)
 
-    # --- resolve ---
     result = await resolve_one(source_url, log)
 
     if not result:
@@ -461,7 +455,6 @@ async def fire_one(state: dict, p: dict) -> dict:
     p["current"] = {"stage": "post", "filename": filename}
     await persist(state)
 
-    # --- post ---
     ok = await post_to_buffer(state, video_url, source_url,
                               channel_id, template, log)
 
@@ -544,7 +537,7 @@ async def on_startup():
 
     for p in state.get("pipelines", []):
         if p.get("status") == "running":
-            p["status"] = "pending"   # let work retry
+            p["status"] = "pending"
         if p.get("current"):
             p["current"] = None
 

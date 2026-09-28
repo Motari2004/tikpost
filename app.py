@@ -5,7 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, File, UploadFile
+import httpx
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -27,9 +28,10 @@ from worker import (
 UTC = ZoneInfo("UTC")
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+def _self_base() -> str:
+    return os.getenv("SELF_BASE", "https://tikpost-murex.vercel.app").rstrip("/")
+
+
 def find_pipeline_in(state: dict, pid: str) -> dict | None:
     for p in state.get("pipelines", []):
         if p["id"] == pid:
@@ -43,12 +45,10 @@ async def lifespan(app: FastAPI):
         await init_pool()
     except Exception as e:
         print(f"[lifespan] init_pool failed: {e}", flush=True)
-
     try:
         await on_startup()
     except Exception as e:
         print(f"[lifespan] on_startup failed: {e}", flush=True)
-
     try:
         yield
     finally:
@@ -60,10 +60,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="tikpost", lifespan=lifespan)
 
-
-# ------------------------------------------------------------------
-# CORS
-# ------------------------------------------------------------------
 _origins_env = os.getenv("CORS_ORIGINS", "").strip()
 allow_origins = (
     [o.strip() for o in _origins_env.split(",") if o.strip()]
@@ -84,13 +80,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 TEMPLATES = Path(__file__).parent / "templates"
 
 
-# ------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------
 class PipelineInput(BaseModel):
     name: str
     channel_id: str
@@ -116,9 +108,6 @@ def _normalize_schedule(data: PipelineInput) -> tuple[str, str, str]:
     return "random", "09:00", "13:00"
 
 
-# ------------------------------------------------------------------
-# UI + health
-# ------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     idx = TEMPLATES / "index.html"
@@ -132,9 +121,6 @@ async def healthz():
     return {"ok": True}
 
 
-# ------------------------------------------------------------------
-# Status
-# ------------------------------------------------------------------
 @app.get("/api/status")
 async def status():
     s = await load_state_from_db()
@@ -160,16 +146,15 @@ async def status():
     }
 
 
-# ------------------------------------------------------------------
-# CRON: tick (synchronous, does resolve + post inline)
-# ------------------------------------------------------------------
+# ==================================================================
+# CRON ENDPOINT 1 — tick (fast, dispatches work, returns)
+# ==================================================================
 @app.get("/api/cron/tick")
 @app.post("/api/cron/tick")
 async def cron_tick():
     """
-    Reads state, fires every due pipeline synchronously.
-    Each fire = resolve (Render) + post (Buffer). Runs inside the
-    function's maxDuration budget (60s on Pro).
+    Fast. Marks due pipelines as pending, dispatches /api/internal/work,
+    returns immediately. Never runs resolve or post inline.
     """
     state = await load_state_from_db()
     state["last_tick"] = now_utc().isoformat()
@@ -178,41 +163,100 @@ async def cron_tick():
     due = find_due_pipelines(state)
     await persist(state)
 
-    fired = []
-    for pid in due:
+    dispatched = []
+    if due:
         try:
-            result = await fire_pipeline_by_id(pid)
-            fired.append(result)
+            async with httpx.AsyncClient(timeout=2) as client:
+                try:
+                    await client.post(f"{_self_base()}/api/internal/work")
+                    dispatched.append("ok")
+                except httpx.TimeoutException:
+                    # Expected: work is still running on Vercel. That's fine.
+                    dispatched.append("dispatched")
         except Exception as e:
-            print(f"[tick] fire failed for {pid[:8]}: "
-                  f"{type(e).__name__}: {e}", flush=True)
-            fired.append({
-                "pipeline": pid,
-                "success": False,
-                "reason": f"{type(e).__name__}: {e}",
-            })
+            print(f"[tick] dispatch failed: {type(e).__name__}: {e}",
+                  flush=True)
 
     return {
         "ok": True,
-        "fired": fired,
-        "due": due,
+        "marked_pending": due,
+        "dispatched": dispatched,
         "now": utc_iso(now_utc()),
         "tick_count": state["tick_count"],
     }
 
 
-# ------------------------------------------------------------------
-# CRON: daily roll
-# ------------------------------------------------------------------
+# ==================================================================
+# CRON ENDPOINT 2 — daily-roll
+# ==================================================================
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
 async def cron_daily_roll():
     return await daily_roll()
 
 
-# ------------------------------------------------------------------
+# ==================================================================
+# INTERNAL — work (called by tick, not by cron)
+# ==================================================================
+@app.post("/api/internal/work")
+@app.get("/api/internal/work")
+async def internal_work():
+    """
+    Slow. Picks up ONE pending pipeline and does the resolve + post.
+    Runs as its own Vercel function with its own timeout budget.
+    """
+    state = await load_state_from_db()
+
+    pending = [
+        p for p in state.get("pipelines", [])
+        if p.get("status") == "pending"
+    ]
+
+    if not pending:
+        return {"ok": True, "fired": [], "pending_remaining": 0,
+                "now": utc_iso(now_utc())}
+
+    p = pending[0]
+
+    # Re-read to avoid double-fire from stale list
+    state = await load_state_from_db()
+    fresh = None
+    for x in state.get("pipelines", []):
+        if x["id"] == p["id"]:
+            fresh = x
+            break
+
+    if not fresh or fresh.get("status") != "pending":
+        return {"ok": True, "fired": [], "reason": "already_taken",
+                "now": utc_iso(now_utc())}
+
+    fresh["status"] = "running"
+    await persist(state)
+
+    fired = []
+    try:
+        result = await fire_pipeline_by_id(fresh["id"])
+        fired.append(result)
+    except Exception as e:
+        print(f"[work] fire failed {fresh['id'][:8]}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        fired.append({
+            "pipeline": fresh["id"],
+            "success": False,
+            "reason": f"{type(e).__name__}: {e}",
+        })
+
+    return {
+        "ok": True,
+        "fired": fired,
+        "pending_remaining": max(0, len(pending) - 1),
+        "now": utc_iso(now_utc()),
+    }
+
+
+# ==================================================================
 # Settings
-# ------------------------------------------------------------------
+# ==================================================================
 @app.get("/api/settings")
 async def get_settings():
     s = await load_state_from_db()
@@ -249,9 +293,6 @@ async def clear_buffer_key():
     return {"ok": True}
 
 
-# ------------------------------------------------------------------
-# Slots
-# ------------------------------------------------------------------
 @app.get("/api/slots")
 async def slots(count: int = 10):
     s = await load_state_from_db()
@@ -271,9 +312,6 @@ async def random_slot(exclude: str = ""):
     return {"time": roll_one_slot(exclude or None)}
 
 
-# ------------------------------------------------------------------
-# Pipelines CRUD
-# ------------------------------------------------------------------
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     try:
@@ -328,7 +366,7 @@ async def update_pipeline_route(pid: str, data: PipelineInput):
     p["manual_slot1"] = s1
     p["manual_slot2"] = s2
 
-    if p.get("status") in ("scheduled", "running"):
+    if p.get("status") in ("scheduled", "running", "pending"):
         try:
             p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
             p["next_slot"] = utc_iso(next_slot_after_pipeline(p, state, now_utc()))
@@ -400,9 +438,6 @@ async def pipeline_reset(pid: str):
     return {"ok": True}
 
 
-# ------------------------------------------------------------------
-# Channels
-# ------------------------------------------------------------------
 @app.get("/api/channels")
 async def channels():
     s = await load_state_from_db()
@@ -418,9 +453,6 @@ async def channels():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# ------------------------------------------------------------------
-# Upload
-# ------------------------------------------------------------------
 @app.post("/api/upload")
 async def upload_json(file: UploadFile = File(...)):
     import json as _json
@@ -441,9 +473,6 @@ async def upload_json(file: UploadFile = File(...)):
     return {"ok": True, "urls": urls, "count": len(urls)}
 
 
-# ------------------------------------------------------------------
-# Local dev
-# ------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
