@@ -20,9 +20,7 @@ from worker import (
     ensure_slots_for_today, reroll_slots_today,
     daily_reroll_loop, get_buffer_key,
     load_state_from_db, persist_now,
-    _today_local_str, _validate_hhmm,
-    _derive_manual_times, roll_slot_one,
-    DEFAULT_MANUAL_GAP_MIN,
+    _today_local_str, _validate_hhmm, roll_one_slot,
     WINDOW_START, WINDOW_END, POSTS_PER_DAY, MIN_GAP_MIN,
 )
 
@@ -95,8 +93,8 @@ class PipelineInput(BaseModel):
     tweet_template: str
     urls: list[str]
     schedule_mode: str = "random"
-    manual_first: str = "09:00"
-    manual_gap_min: int = DEFAULT_MANUAL_GAP_MIN
+    manual_slot1: str = "09:00"
+    manual_slot2: str = "13:00"
 
 
 class BufferKeyInput(BaseModel):
@@ -114,22 +112,17 @@ def _check_cron_secret(request: Request):
         raise HTTPException(status_code=401, detail="invalid cron secret")
 
 
-def _normalize_schedule(data: PipelineInput) -> tuple[str, str, int]:
+def _normalize_schedule(data: PipelineInput) -> tuple[str, str, str]:
     mode = (data.schedule_mode or "random").lower()
     if mode not in ("random", "manual"):
         mode = "random"
 
     if mode == "manual":
-        first = _validate_hhmm(data.manual_first or "09:00")
-        gap = int(data.manual_gap_min or DEFAULT_MANUAL_GAP_MIN)
-        if gap < MIN_GAP_MIN:
-            gap = MIN_GAP_MIN
-        if gap > 12 * 60:
-            gap = 12 * 60
-        _derive_manual_times(first, gap)
-        return mode, first, gap
+        s1 = _validate_hhmm(data.manual_slot1 or "09:00")
+        s2 = _validate_hhmm(data.manual_slot2 or "13:00")
+        return mode, s1, s2
 
-    return "random", "09:00", DEFAULT_MANUAL_GAP_MIN
+    return "random", "09:00", "13:00"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -274,15 +267,14 @@ async def slots_reroll():
 
 
 @app.get("/api/random-slot")
-async def random_slot():
-    """Roll a random slot 1 inside the window. Used by the 🎲 button."""
-    return {"first": roll_slot_one()}
+async def random_slot(exclude: str = ""):
+    return {"time": roll_one_slot(exclude or None)}
 
 
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     try:
-        mode, first, gap = _normalize_schedule(data)
+        mode, s1, s2 = _normalize_schedule(data)
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
@@ -295,8 +287,8 @@ async def create_pipeline(data: PipelineInput):
         "tweet_template": data.tweet_template,
         "urls": [u.strip() for u in data.urls if u.strip()],
         "schedule_mode": mode,
-        "manual_first": first,
-        "manual_gap_min": gap,
+        "manual_slot1": s1,
+        "manual_slot2": s2,
         "cursor": 0,
         "posted_count": 0,
         "failed_count": 0,
@@ -326,7 +318,7 @@ async def create_pipeline(data: PipelineInput):
 @app.put("/api/pipelines/{pid}")
 async def update_pipeline_route(pid: str, data: PipelineInput):
     try:
-        mode, first, gap = _normalize_schedule(data)
+        mode, s1, s2 = _normalize_schedule(data)
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
@@ -337,8 +329,8 @@ async def update_pipeline_route(pid: str, data: PipelineInput):
         tweet_template=data.tweet_template,
         urls=[u.strip() for u in data.urls if u.strip()],
         schedule_mode=mode,
-        manual_first=first,
-        manual_gap_min=gap,
+        manual_slot1=s1,
+        manual_slot2=s2,
     )
     if not p:
         return JSONResponse({"error": "not found"}, status_code=404)

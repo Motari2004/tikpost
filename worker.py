@@ -20,15 +20,14 @@ POST_BACKOFF = float(os.getenv("BUFFER_RETRY_DELAY", "10"))
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
 
-WINDOW_START  = (6, 0)    # 6:00 AM
-WINDOW_END    = (23, 0)   # 11:00 PM
+WINDOW_START  = (6, 0)
+WINDOW_END    = (23, 0)
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120
-DEFAULT_MANUAL_GAP_MIN = 240   # 4h
 
 
 # ==================================================================
-# In-memory state cache
+# State
 # ==================================================================
 _STATE: dict = {
     "pipelines": [],
@@ -137,22 +136,6 @@ def _validate_hhmm(t: str) -> str:
     return f"{h:02d}:{m:02d}"
 
 
-def _add_minutes_hhmm(hhmm: str, minutes: int) -> str:
-    h, m = hhmm.split(":")
-    total = int(h) * 60 + int(m) + minutes
-    total %= 24 * 60
-    h2, m2 = divmod(total, 60)
-    return f"{h2:02d}:{m2:02d}"
-
-
-def _derive_manual_times(first_hhmm: str, gap_min: int) -> list[str]:
-    first = _validate_hhmm(first_hhmm)
-    if POSTS_PER_DAY == 1:
-        return [first]
-    second = _add_minutes_hhmm(first, gap_min)
-    return [first, second]
-
-
 # ==================================================================
 # Buffer key
 # ==================================================================
@@ -162,7 +145,7 @@ def get_buffer_key() -> str:
 
 
 # ==================================================================
-# Random daily slots
+# Random slots
 # ==================================================================
 def _roll_slots_for(day) -> list[str]:
     start_min = _minutes(*WINDOW_START)
@@ -232,11 +215,12 @@ def today_slots_utc() -> list[datetime]:
 
 
 def _times_for_pipeline(p: dict) -> list[str]:
+    """Two times: manual uses slot1 + slot2 as-set; random uses today's roll."""
     mode = (p.get("schedule_mode") or "random").lower()
     if mode == "manual":
-        first = p.get("manual_first") or "09:00"
-        gap   = int(p.get("manual_gap_min") or DEFAULT_MANUAL_GAP_MIN)
-        return _derive_manual_times(first, gap)
+        s1 = _validate_hhmm(p.get("manual_slot1") or "09:00")
+        s2 = _validate_hhmm(p.get("manual_slot2") or "13:00")
+        return sorted([s1, s2])
     return ensure_slots_for_today()["times"]
 
 
@@ -329,22 +313,21 @@ def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
     return out
 
 
-def roll_slot_one() -> str:
-    """Roll a random slot 1 inside the window, respecting the gap constraint."""
+def roll_one_slot(exclude: str | None = None) -> str:
+    """Roll a single random time inside the window, optionally excluding a time."""
     start_min = _minutes(*WINDOW_START)
     end_min   = _minutes(*WINDOW_END)
     span      = end_min - start_min
 
-    for _ in range(50):
-        offset = random.randint(0, span)
-        total = start_min + offset
-        if total + DEFAULT_MANUAL_GAP_MIN <= end_min:
-            h, m = divmod(total, 60)
-            return f"{h:02d}:{m:02d}"
+    for _ in range(60):
+        total = start_min + random.randint(0, span)
+        h, m = divmod(total, 60)
+        hhmm = f"{h:02d}:{m:02d}"
+        if exclude and hhmm == exclude:
+            continue
+        return hhmm
 
-    # fallback
-    total = start_min + span // 3
-    h, m = divmod(total, 60)
+    h, m = divmod(start_min + span // 3, 60)
     return f"{h:02d}:{m:02d}"
 
 
@@ -424,7 +407,7 @@ async def post(video_url: str, source_url: str,
 
 
 # ==================================================================
-# Per-pipeline runner
+# Runner
 # ==================================================================
 class PipelineRunner:
     def __init__(self, pid: str):
@@ -478,16 +461,9 @@ class PipelineRunner:
             return
 
         if mode == "manual":
-            try:
-                times = _times_for_pipeline(p)
-            except ValueError as e:
-                self.log(f"❌ invalid manual time: {e}")
-                update_pipeline(self.pid, status="failed")
-                return
+            times = _times_for_pipeline(p)
             pretty = ", ".join(_hhmm_to_12h(t) for t in times)
-            gap = int(p.get("manual_gap_min") or DEFAULT_MANUAL_GAP_MIN)
-            self.log(f"🗓 schedule: manual · first {_hhmm_to_12h(times[0])} "
-                     f"+{gap}m → {pretty} (Nairobi)")
+            self.log(f"🗓 schedule: manual · {pretty} (Nairobi)")
         else:
             ensure_slots_for_today()
             slots_today = _STATE["slots"]["times"]
@@ -589,9 +565,6 @@ class PipelineRunner:
         self.log(f"🏁 {status} posted={posted} failed={failed}")
 
 
-# ==================================================================
-# Runner registry
-# ==================================================================
 runners: dict[str, PipelineRunner] = {}
 
 
@@ -618,7 +591,7 @@ def is_running(pid: str) -> bool:
 
 
 # ==================================================================
-# Background daily re-roll
+# Daily re-roll
 # ==================================================================
 async def daily_reroll_loop():
     print("[slots] background reroll loop started", flush=True)
