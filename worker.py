@@ -18,6 +18,10 @@ POST_RETRIES       = int(os.getenv("BUFFER_RETRY_MAX", "1"))
 POST_BACKOFF       = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
 MAX_URL_RETRIES    = int(os.getenv("MAX_URL_RETRIES", "3"))
 
+# Inline retries within a single fire (before falling back to next-slot retry)
+INLINE_RESOLVE_ATTEMPTS = int(os.getenv("INLINE_RESOLVE_ATTEMPTS", "3"))
+INLINE_RESOLVE_BACKOFF  = float(os.getenv("INLINE_RESOLVE_BACKOFF", "5"))
+
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
 
@@ -318,7 +322,7 @@ def _log(state: dict, pid: str, msg: str):
 
 
 # ==================================================================
-# Retry tracking (per-URL)
+# Retry tracking (per-URL, across slots)
 # ==================================================================
 def _get_retry_count(p: dict, source_url: str) -> int:
     retries = p.get("retries") or {}
@@ -338,42 +342,66 @@ def _clear_retry(p: dict, source_url: str):
 
 
 # ==================================================================
-# Resolve
+# Resolve — with inline retries
 # ==================================================================
 async def resolve_one(url: str, log) -> dict | None:
+    """
+    Resolve a TikTok URL.
+
+    Retries inline up to INLINE_RESOLVE_ATTEMPTS times before giving up.
+    Each attempt gets a full RESOLVE_TIMEOUT budget. The first attempt
+    on a cold resolver wakes it up; the second or third usually succeeds
+    within the same fire.
+    """
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["X-API-Key"] = API_KEY
 
-    log(f"[resolve] POST {API_BASE}/api/v1/resolve")
+    for attempt in range(1, INLINE_RESOLVE_ATTEMPTS + 1):
+        log(f"[resolve] attempt {attempt}/{INLINE_RESOLVE_ATTEMPTS} "
+            f"→ {API_BASE}")
 
-    try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(RESOLVE_TIMEOUT, connect=15.0),
-        ) as client:
-            r = await client.post(
-                f"{API_BASE}/api/v1/resolve",
-                json={"url": url},
-                headers=headers,
-            )
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(RESOLVE_TIMEOUT, connect=15.0),
+            ) as client:
+                r = await client.post(
+                    f"{API_BASE}/api/v1/resolve",
+                    json={"url": url},
+                    headers=headers,
+                )
 
-        if r.status_code != 200:
-            log(f"[resolve] HTTP {r.status_code}: {r.text[:160]}")
-            return None
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                except Exception as e:
+                    log(f"[resolve] bad JSON: {e}")
+                    data = None
 
-        data = r.json()
-        if data.get("status") != "ok":
-            log(f"[resolve] non-ok: {str(data)[:160]}")
-            return None
-        return data
+                if data and data.get("status") == "ok":
+                    return data
 
-    except httpx.TimeoutException:
-        log(f"[resolve] timeout after {RESOLVE_TIMEOUT}s")
-        return None
-    except Exception as e:
-        log(f"[resolve] {type(e).__name__}: {e}")
-        return None
+                log(f"[resolve] non-ok response: "
+                    f"{str(data)[:160] if data else 'unknown'}")
+            else:
+                log(f"[resolve] HTTP {r.status_code}: {r.text[:160]}")
+
+        except httpx.TimeoutException:
+            log(f"[resolve] timeout after {RESOLVE_TIMEOUT}s "
+                f"(attempt {attempt}/{INLINE_RESOLVE_ATTEMPTS})")
+        except httpx.ConnectError as e:
+            log(f"[resolve] connect error (attempt {attempt}): {e}")
+        except Exception as e:
+            log(f"[resolve] {type(e).__name__} (attempt {attempt}): {e}")
+
+        # Backoff between inline attempts, but not after the last one
+        if attempt < INLINE_RESOLVE_ATTEMPTS:
+            log(f"[resolve] retrying in {INLINE_RESOLVE_BACKOFF:.0f}s…")
+            await asyncio.sleep(INLINE_RESOLVE_BACKOFF)
+
+    log(f"[resolve] all {INLINE_RESOLVE_ATTEMPTS} inline attempts failed")
+    return None
 
 
 # ==================================================================
@@ -422,7 +450,7 @@ async def fetch_transcript(source_url: str, log) -> str | None:
 
 
 # ==================================================================
-# Caption builder — transcript verbatim, no URL, no filter
+# Caption builder — transcript verbatim
 # ==================================================================
 def _apply_tokens(text: str, p: dict, cursor: int, source_url: str) -> str:
     urls = p.get("urls") or []
@@ -448,7 +476,7 @@ def build_caption(p: dict, cursor: int, source_url: str,
                   transcript: str | None) -> str:
     """
     Use whatever the transcript service returns, verbatim.
-    Fall back to the template only if the transcript is completely empty.
+    Fall back to the template only if the transcript is empty.
     """
     if p.get("use_transcript", True) and transcript:
         cap = transcript.strip()
@@ -555,18 +583,19 @@ async def fire_one(state: dict, p: dict) -> dict:
 
     source_url = urls[cursor]
     log = lambda m: _log(state, pid, m)
-    attempt = _get_retry_count(p, source_url) + 1
+    slot_attempt = _get_retry_count(p, source_url) + 1
 
     _log(
         state, pid,
         f"▶ [{cursor+1}/{len(urls)}] {source_url}"
-        + (f" (attempt {attempt}/{MAX_URL_RETRIES})" if attempt > 1 else ""),
+        + (f" (slot attempt {slot_attempt}/{MAX_URL_RETRIES})"
+           if slot_attempt > 1 else ""),
     )
     p["current"] = {"stage": "resolve", "url": source_url}
     p["status"] = "running"
     await persist(state)
 
-    # ---- 1. resolve ----
+    # ---- 1. resolve (with inline retries) ----
     result = await resolve_one(source_url, log)
 
     if not result:
@@ -574,8 +603,9 @@ async def fire_one(state: dict, p: dict) -> dict:
 
         if new_count < MAX_URL_RETRIES:
             _log(state, pid,
-                 f"⏳ resolve failed (attempt {new_count}/{MAX_URL_RETRIES}) "
-                 f"— will retry")
+                 f"⏳ resolve failed after inline retries "
+                 f"(slot attempt {new_count}/{MAX_URL_RETRIES}) — will retry "
+                 f"at next slot")
             p["current"] = None
             p["status"] = "scheduled"
             nxt = next_slot_after_pipeline(p, state, now_utc())
@@ -588,7 +618,8 @@ async def fire_one(state: dict, p: dict) -> dict:
                     "reason": "resolve_failed_retry", "attempt": new_count}
 
         _log(state, pid,
-             f"❌ resolve failed after {new_count} attempts — skipping URL")
+             f"❌ resolve failed after {new_count} slot attempts — "
+             f"skipping URL")
         _clear_retry(p, source_url)
         p["cursor"] = cursor + 1
         p["failed_count"] = int(p.get("failed_count") or 0) + 1
@@ -645,8 +676,8 @@ async def fire_one(state: dict, p: dict) -> dict:
 
         if new_count < MAX_URL_RETRIES:
             _log(state, pid,
-                 f"⏳ post failed (attempt {new_count}/{MAX_URL_RETRIES}) "
-                 f"— will retry")
+                 f"⏳ post failed (slot attempt {new_count}/{MAX_URL_RETRIES}) "
+                 f"— will retry at next slot")
             p["current"] = None
             p["status"] = "scheduled"
             nxt = next_slot_after_pipeline(p, state, now_utc())
