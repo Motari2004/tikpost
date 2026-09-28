@@ -64,7 +64,7 @@ async def persist(state: dict) -> None:
 
 
 # ==================================================================
-# Time helpers
+# Time
 # ==================================================================
 def fmt_12h(dt: datetime) -> str:
     return dt.astimezone(NAIROBI).strftime("%I:%M %p").lstrip("0")
@@ -189,7 +189,6 @@ def _slots_for_day(p: dict, state: dict, day) -> list[datetime]:
         times = ensure_slots_for_today(state)["times"]
         return [_parse_hhmm_on(day, t).astimezone(UTC) for t in times]
 
-    # Deterministic per-day roll for future days — stable preview
     seed = int(hashlib.sha256(day.isoformat().encode()).hexdigest()[:8], 16)
     rnd = random.Random(seed)
     start_min = _minutes(*WINDOW_START)
@@ -322,6 +321,35 @@ async def post_to_buffer(state: dict, video_url: str, source_url: str,
 
 
 # ==================================================================
+# Due pipeline discovery — REQUIRED by app.py
+# ==================================================================
+def find_due_pipelines(state: dict) -> list[str]:
+    now = now_utc()
+    stuck_before = now - timedelta(minutes=3)
+    due = []
+
+    for p in state.get("pipelines", []):
+        if p.get("status") not in ("scheduled", "running"):
+            continue
+        ns = p.get("next_slot")
+        if not ns:
+            continue
+        try:
+            due_at = datetime.fromisoformat(ns.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if p.get("status") == "running" and due_at < stuck_before:
+            p["status"] = "scheduled"
+            p["current"] = None
+
+        if due_at <= now:
+            due.append(p["id"])
+
+    return due
+
+
+# ==================================================================
 # Fire one pipeline
 # ==================================================================
 def _log(state: dict, pid: str, msg: str):
@@ -353,7 +381,7 @@ async def fire_one(state: dict, p: dict) -> dict:
     p["current"] = {"stage": "resolve", "url": source_url}
     p["status"] = "running"
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
         result = await resolve(client, source_url)
 
     if not result:
@@ -401,61 +429,39 @@ async def fire_one(state: dict, p: dict) -> dict:
     return {"pipeline": pid, "fired": True, "success": ok, "filename": filename}
 
 
-# ==================================================================
-# tick — called by cron every minute
-# ==================================================================
-async def tick() -> dict:
+async def fire_pipeline_by_id(pid: str) -> dict:
     state = await load_state_from_db()
-    state["last_tick"] = now_utc().isoformat()
-    state["tick_count"] = int(state.get("tick_count") or 0) + 1
+    p = None
+    for x in state.get("pipelines", []):
+        if x["id"] == pid:
+            p = x
+            break
+    if not p:
+        return {"pipeline": pid, "fired": False, "reason": "not_found"}
 
-    now = now_utc()
-    fired = []
+    if p.get("status") not in ("scheduled", "running"):
+        return {"pipeline": pid, "fired": False, "reason": "not_active"}
 
-    for p in list(state.get("pipelines", [])):
-        if p.get("status") not in ("scheduled", "running"):
-            continue
+    ns = p.get("next_slot")
+    if not ns:
+        return {"pipeline": pid, "fired": False, "reason": "no_slot"}
+    try:
+        due_at = datetime.fromisoformat(ns.replace("Z", "+00:00"))
+    except Exception:
+        return {"pipeline": pid, "fired": False, "reason": "bad_slot"}
+    if due_at > now_utc():
+        return {"pipeline": pid, "fired": False, "reason": "not_due"}
 
-        if not p.get("next_slot"):
-            try:
-                nxt = next_slot_after_pipeline(p, state, now)
-                p["next_slot"] = utc_iso(nxt)
-                p["next_slot_nairobi"] = nairobi_iso(nxt)
-                p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
-            except Exception as e:
-                print(f"[tick] compute failed {p['id'][:8]}: {e}", flush=True)
-            continue
-
-        try:
-            due = datetime.fromisoformat(p["next_slot"].replace("Z", "+00:00"))
-        except Exception:
-            nxt = next_slot_after_pipeline(p, state, now)
-            p["next_slot"] = utc_iso(nxt)
-            p["next_slot_nairobi"] = nairobi_iso(nxt)
-            continue
-
-        if due > now:
-            continue
-
-        try:
-            r = await fire_one(state, p)
-            fired.append(r)
-        except Exception as e:
-            print(f"[tick] fire failed {p['id'][:8]}: {e}", flush=True)
-            _log(state, p["id"], f"❌ fire error: {e}")
-
+    p["status"] = "running"
     await persist(state)
 
-    return {
-        "ok": True,
-        "fired": fired,
-        "now": utc_iso(now),
-        "tick_count": state["tick_count"],
-    }
+    result = await fire_one(state, p)
+    await persist(state)
+    return result
 
 
 # ==================================================================
-# daily roll
+# Daily roll
 # ==================================================================
 async def daily_roll() -> dict:
     state = await load_state_from_db()
