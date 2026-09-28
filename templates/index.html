@@ -108,14 +108,18 @@
     .pipelines {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-      gap: 16px; margin-bottom: 20px;
+      gap: 16px;
+      margin-bottom: 20px;
     }
+
     .pipeline {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 14px;
       padding: 18px;
-      display: flex; flex-direction: column; gap: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
       transition: border-color 0.2s;
     }
     .pipeline.running { border-color: rgba(53,196,107,0.4); }
@@ -138,9 +142,12 @@
     .pipeline-meta .dot-sep { opacity: 0.5; }
     .mode-tag {
       display: inline-flex; align-items: center; gap: 4px;
-      padding: 1px 7px; border-radius: 999px;
-      font-size: 10.5px; font-weight: 600;
-      letter-spacing: 0.03em; text-transform: uppercase;
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
     }
     .mode-tag.random { background: rgba(74,144,226,0.15); color: var(--accent); }
     .mode-tag.manual { background: rgba(240,165,0,0.15); color: var(--warn); }
@@ -159,6 +166,7 @@
     .status-badge.done { background: rgba(53,196,107,0.15); color: var(--success); }
     .status-badge.failed { background: rgba(226,85,85,0.15); color: var(--danger); }
     .status-badge.stopped { background: rgba(240,165,0,0.15); color: var(--warn); }
+
     @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.5 } }
 
     .countdown {
@@ -195,7 +203,8 @@
     .upcoming-title {
       font-size: 11px; color: var(--muted);
       text-transform: uppercase; letter-spacing: 0.06em;
-      font-weight: 600; margin-bottom: 8px;
+      font-weight: 600;
+      margin-bottom: 8px;
       display: flex; align-items: center; justify-content: space-between;
     }
     .upcoming-list {
@@ -208,7 +217,8 @@
     }
     .upcoming-item.next {
       background: rgba(74,144,226,0.1);
-      color: var(--accent); font-weight: 700;
+      color: var(--accent);
+      font-weight: 700;
     }
     .upcoming-item.past { opacity: 0.4; }
     .upcoming-item .idx {
@@ -431,6 +441,7 @@
 
   </div>
 
+  <!-- Pipeline modal -->
   <div class="modal-backdrop" id="modal-backdrop">
     <div class="modal">
       <h2 id="modal-title">New pipeline</h2>
@@ -501,6 +512,7 @@
     </div>
   </div>
 
+  <!-- Settings modal -->
   <div class="modal-backdrop" id="settings-backdrop">
     <div class="modal">
       <h2>Settings</h2>
@@ -540,6 +552,7 @@
       return r.json();
     }
 
+    // ---------- Time helpers ----------
     function to12h(hhmm) {
       if (!hhmm) return '';
       const [hh, mm] = hhmm.split(':').map(Number);
@@ -561,8 +574,10 @@
     function nairobiLabel(isoUtc) {
       const dt = new Date(isoUtc);
       return dt.toLocaleString('en-US', {
-        timeZone: 'Africa/Nairobi', hour12: true,
-        weekday: 'short', hour: 'numeric', minute: '2-digit',
+        timeZone: 'Africa/Nairobi',
+        hour12: true,
+        weekday: 'short',
+        hour: 'numeric', minute: '2-digit',
       });
     }
 
@@ -577,12 +592,15 @@
       })[c]);
     }
 
+    // ---------- State ----------
     let pipelinesCache = [];
     let windowCache = null;
     let slotsTodayCache = { times: [], rolled_at: null };
     let editingId = null;
     let currentScheduleMode = 'random';
+    const openLogs = new Set();   // track which pipeline logs are open
 
+    // ---------- Refresh ----------
     async function refresh() {
       try {
         const s = await api('/api/status');
@@ -606,7 +624,10 @@
 
       const wrap = $('w-today-slots');
       const times = slotsTodayCache.times || [];
-      if (!times.length) { wrap.textContent = '—'; return; }
+      if (!times.length) {
+        wrap.textContent = '—';
+        return;
+      }
 
       const nowLocal = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
       const nowMin = nowLocal.getHours() * 60 + nowLocal.getMinutes();
@@ -624,7 +645,8 @@
 
       if (slotsTodayCache.rolled_at) {
         const rolledAt = new Date(slotsTodayCache.rolled_at).toLocaleString('en-US', {
-          timeZone: 'Africa/Nairobi', hour12: true,
+          timeZone: 'Africa/Nairobi',
+          hour12: true,
           hour: 'numeric', minute: '2-digit',
         });
         $('w-rolled').textContent = `· rolled at ${rolledAt}`;
@@ -636,10 +658,15 @@
     async function rerollSlots() {
       if (!confirm('Roll new random slots for today?')) return;
       const r = await api('/api/slots/reroll', { method: 'POST' });
-      if (r.ok) { toast('New random slots generated', 'ok'); refresh(); }
-      else toast('Reroll failed', 'err');
+      if (r.ok) {
+        toast('New random slots generated', 'ok');
+        refresh();
+      } else {
+        toast('Reroll failed', 'err');
+      }
     }
 
+    // ---------- Pipelines ----------
     function renderPipelines() {
       const wrap = $('pipelines');
       const empty = $('empty');
@@ -671,7 +698,7 @@
     function renderUpcomingSlots(p) {
       const mode = p.schedule_mode || 'random';
 
-      // For manual pipelines, show a fixed "every day" schedule
+      // Manual: show a fixed "every day" schedule
       if (mode === 'manual') {
         const s1 = p.manual_slot1 || '09:00';
         const s2 = p.manual_slot2 || '13:00';
@@ -852,6 +879,17 @@
           <button class="danger small" onclick="deletePipeline('${p.id}')">🗑 Delete</button>
         </div>
       `;
+
+      // Re-apply log open state so it survives the 2s auto-refresh
+      const logEl = card.querySelector('.pipeline-log');
+      const logBtn = card.querySelector('.log-toggle');
+      if (logEl && openLogs.has(p.id)) {
+        const wasNearBottom =
+          logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+        logEl.classList.add('open');
+        if (logBtn) logBtn.textContent = '▾ Hide log';
+        if (wasNearBottom) logEl.scrollTop = logEl.scrollHeight;
+      }
     }
 
     function toggleLog(pid) {
@@ -859,7 +897,12 @@
       const btn = el.previousElementSibling;
       const open = el.classList.toggle('open');
       btn.textContent = open ? '▾ Hide log' : '▸ Show log';
-      if (open) el.scrollTop = el.scrollHeight;
+      if (open) {
+        openLogs.add(pid);
+        el.scrollTop = el.scrollHeight;
+      } else {
+        openLogs.delete(pid);
+      }
     }
 
     async function startPipeline(pid) {
@@ -882,10 +925,12 @@
     async function deletePipeline(pid) {
       if (!confirm('Delete this pipeline permanently?')) return;
       await api(`/api/pipelines/${pid}`, { method: 'DELETE' });
+      openLogs.delete(pid);
       toast('Pipeline deleted', 'ok');
       refresh();
     }
 
+    // ---------- Schedule mode ----------
     function setScheduleMode(mode) {
       currentScheduleMode = mode;
       document.querySelectorAll('#f-schedule-mode .seg-btn').forEach(b => {
@@ -918,6 +963,7 @@
       b.addEventListener('click', () => setScheduleMode(b.dataset.mode));
     });
 
+    // ---------- Modal ----------
     function openCreateModal() {
       editingId = null;
       $('modal-title').textContent = 'New pipeline';
@@ -988,6 +1034,7 @@
       }
     }
 
+    // ---------- Channels ----------
     async function loadChannels() {
       const sel = $('f-channel');
       const cur = sel.value;
@@ -1013,12 +1060,14 @@
       }
     }
 
+    // ---------- URL count ----------
     function updateUrlCount() {
       const n = $('f-urls').value.split('\n').filter(u => u.trim()).length;
       $('url-count').textContent = `${n} URL${n !== 1 ? 's' : ''}`;
     }
     $('f-urls').addEventListener('input', updateUrlCount);
 
+    // ---------- JSON upload ----------
     const dz = $('dropzone');
     const fileInput = $('file-input');
     dz.addEventListener('click', () => fileInput.click());
@@ -1035,7 +1084,8 @@
 
     async function uploadFile(file) {
       if (!file.name.toLowerCase().endsWith('.json')) {
-        toast('Only .json files', 'err'); return;
+        toast('Only .json files', 'err');
+        return;
       }
       const fd = new FormData();
       fd.append('file', file);
@@ -1056,15 +1106,24 @@
       }
     }
 
+    // ---------- Settings ----------
     async function openSettingsModal() {
       const s = await api('/api/settings');
       const hint = $('s-buffer-hint');
-      hint.textContent = s.has_key ? `Current key: ${s.preview}` : 'No key set.';
+      if (s.has_key) {
+        hint.textContent = `Current key: ${s.preview}`;
+      } else {
+        hint.textContent = 'No key set.';
+      }
       hint.style.color = 'var(--muted)';
       $('s-buffer-key').value = '';
       $('settings-backdrop').classList.add('open');
     }
-    function closeSettingsModal() { $('settings-backdrop').classList.remove('open'); }
+
+    function closeSettingsModal() {
+      $('settings-backdrop').classList.remove('open');
+    }
+
     function toggleKeyVisibility() {
       const el = $('s-buffer-key');
       el.type = el.type === 'password' ? 'text' : 'password';
@@ -1074,15 +1133,18 @@
       const key = $('s-buffer-key').value.trim();
       const hint = $('s-buffer-hint');
       const btn = $('s-buffer-save');
+
       if (!key) {
         hint.textContent = 'Enter a key first.';
         hint.style.color = 'var(--danger)';
         return;
       }
+
       btn.disabled = true;
       btn.textContent = 'Validating…';
       hint.textContent = 'Checking with Buffer…';
       hint.style.color = 'var(--muted)';
+
       try {
         const r = await fetch('/api/settings/buffer-key', {
           method: 'POST',
@@ -1090,6 +1152,7 @@
           body: JSON.stringify({ api_key: key }),
         });
         const data = await r.json();
+
         if (data.ok) {
           hint.textContent = `✓ Valid key${data.email ? ` (${data.email})` : ''}`;
           hint.style.color = 'var(--success)';
@@ -1118,6 +1181,7 @@
       toast('Key cleared', 'ok');
     }
 
+    // ---------- Live countdown ----------
     setInterval(() => {
       pipelinesCache.forEach(p => {
         if (!p.next_slot) return;
@@ -1136,6 +1200,7 @@
       });
     }, 500);
 
+    // ---------- Close modals on backdrop click ----------
     $('modal-backdrop').addEventListener('click', e => {
       if (e.target.id === 'modal-backdrop') closeModal();
     });
@@ -1143,6 +1208,7 @@
       if (e.target.id === 'settings-backdrop') closeSettingsModal();
     });
 
+    // ---------- Boot ----------
     refresh();
     setInterval(refresh, 2000);
   </script>
