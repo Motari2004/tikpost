@@ -5,8 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import httpx
-from fastapi import BackgroundTasks, FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -28,10 +27,9 @@ from worker import (
 UTC = ZoneInfo("UTC")
 
 
-def _self_base() -> str:
-    return os.getenv("SELF_BASE", "https://tikpost-murex.vercel.app").rstrip("/")
-
-
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 def find_pipeline_in(state: dict, pid: str) -> dict | None:
     for p in state.get("pipelines", []):
         if p["id"] == pid:
@@ -62,6 +60,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="tikpost", lifespan=lifespan)
 
+
+# ------------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------------
 _origins_env = os.getenv("CORS_ORIGINS", "").strip()
 allow_origins = (
     [o.strip() for o in _origins_env.split(",") if o.strip()]
@@ -82,9 +84,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 TEMPLATES = Path(__file__).parent / "templates"
 
 
+# ------------------------------------------------------------------
+# Models
+# ------------------------------------------------------------------
 class PipelineInput(BaseModel):
     name: str
     channel_id: str
@@ -110,6 +116,9 @@ def _normalize_schedule(data: PipelineInput) -> tuple[str, str, str]:
     return "random", "09:00", "13:00"
 
 
+# ------------------------------------------------------------------
+# UI + health
+# ------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     idx = TEMPLATES / "index.html"
@@ -123,6 +132,9 @@ async def healthz():
     return {"ok": True}
 
 
+# ------------------------------------------------------------------
+# Status
+# ------------------------------------------------------------------
 @app.get("/api/status")
 async def status():
     s = await load_state_from_db()
@@ -148,9 +160,17 @@ async def status():
     }
 
 
+# ------------------------------------------------------------------
+# CRON: tick (synchronous, does resolve + post inline)
+# ------------------------------------------------------------------
 @app.get("/api/cron/tick")
 @app.post("/api/cron/tick")
-async def cron_tick(background: BackgroundTasks):
+async def cron_tick():
+    """
+    Reads state, fires every due pipeline synchronously.
+    Each fire = resolve (Render) + post (Buffer). Runs inside the
+    function's maxDuration budget (60s on Pro).
+    """
     state = await load_state_from_db()
     state["last_tick"] = now_utc().isoformat()
     state["tick_count"] = int(state.get("tick_count") or 0) + 1
@@ -158,38 +178,41 @@ async def cron_tick(background: BackgroundTasks):
     due = find_due_pipelines(state)
     await persist(state)
 
+    fired = []
     for pid in due:
-        background.add_task(_dispatch_fire, pid)
+        try:
+            result = await fire_pipeline_by_id(pid)
+            fired.append(result)
+        except Exception as e:
+            print(f"[tick] fire failed for {pid[:8]}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            fired.append({
+                "pipeline": pid,
+                "success": False,
+                "reason": f"{type(e).__name__}: {e}",
+            })
 
     return {
         "ok": True,
-        "scheduled": due,
+        "fired": fired,
+        "due": due,
         "now": utc_iso(now_utc()),
         "tick_count": state["tick_count"],
     }
 
 
-async def _dispatch_fire(pid: str):
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(f"{_self_base()}/api/cron/fire/{pid}")
-    except Exception as e:
-        print(f"[tick] dispatch fire failed for {pid[:8]}: {e}", flush=True)
-
-
-@app.get("/api/cron/fire/{pid}")
-@app.post("/api/cron/fire/{pid}")
-async def cron_fire(pid: str):
-    result = await fire_pipeline_by_id(pid)
-    return {"ok": True, "result": result}
-
-
+# ------------------------------------------------------------------
+# CRON: daily roll
+# ------------------------------------------------------------------
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
 async def cron_daily_roll():
     return await daily_roll()
 
 
+# ------------------------------------------------------------------
+# Settings
+# ------------------------------------------------------------------
 @app.get("/api/settings")
 async def get_settings():
     s = await load_state_from_db()
@@ -226,6 +249,9 @@ async def clear_buffer_key():
     return {"ok": True}
 
 
+# ------------------------------------------------------------------
+# Slots
+# ------------------------------------------------------------------
 @app.get("/api/slots")
 async def slots(count: int = 10):
     s = await load_state_from_db()
@@ -245,6 +271,9 @@ async def random_slot(exclude: str = ""):
     return {"time": roll_one_slot(exclude or None)}
 
 
+# ------------------------------------------------------------------
+# Pipelines CRUD
+# ------------------------------------------------------------------
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     try:
@@ -371,6 +400,9 @@ async def pipeline_reset(pid: str):
     return {"ok": True}
 
 
+# ------------------------------------------------------------------
+# Channels
+# ------------------------------------------------------------------
 @app.get("/api/channels")
 async def channels():
     s = await load_state_from_db()
@@ -386,6 +418,9 @@ async def channels():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ------------------------------------------------------------------
+# Upload
+# ------------------------------------------------------------------
 @app.post("/api/upload")
 async def upload_json(file: UploadFile = File(...)):
     import json as _json
@@ -406,6 +441,9 @@ async def upload_json(file: UploadFile = File(...)):
     return {"ok": True, "urls": urls, "count": len(urls)}
 
 
+# ------------------------------------------------------------------
+# Local dev
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
