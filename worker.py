@@ -10,12 +10,11 @@ import httpx
 from buffer import create_post, BufferError
 from db import read_state, write_state
 
-API_BASE     = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
-API_KEY      = os.getenv("API_KEY", "")
-MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "2"))
-RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "50"))   # per attempt
-POST_RETRIES = int(os.getenv("BUFFER_RETRY_MAX", "2"))
-POST_BACKOFF = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
+API_BASE        = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
+API_KEY         = os.getenv("API_KEY", "")
+RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "55"))
+POST_TIMEOUT    = float(os.getenv("POST_TIMEOUT", "20"))
+POST_RETRIES    = int(os.getenv("BUFFER_RETRY_MAX", "1"))
 
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
@@ -24,9 +23,6 @@ WINDOW_START  = (6, 0)
 WINDOW_END    = (23, 0)
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120
-
-# How long to wait for an async resolve before giving up on that URL
-RESOLVE_STALE_SEC = 180   # 3 min
 
 
 # ==================================================================
@@ -287,143 +283,91 @@ def _log(state: dict, pid: str, msg: str):
 
 
 # ==================================================================
-# Resolve (async, fire-and-forget)
+# Resolve — one shot, no retries
 # ==================================================================
-async def _resolve_call(url: str) -> dict | None:
+async def resolve_one(url: str, log) -> dict | None:
     """
-    One resolve attempt with a longer timeout. Returns result or None.
-    Used both by the sync path and the background task.
+    Call the resolver. Exactly like the curl you ran manually.
+    One attempt, generous timeout. Returns the JSON or None.
     """
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["X-API-Key"] = API_KEY
 
+    payload = {"url": url}
+    log(f"[resolve] POST {API_BASE}/api/v1/resolve")
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True,
-                                     timeout=RESOLVE_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(RESOLVE_TIMEOUT, connect=15.0),
+        ) as client:
             r = await client.post(
                 f"{API_BASE}/api/v1/resolve",
-                json={"url": url},
+                json=payload,
                 headers=headers,
             )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("status") == "ok":
-                return data
-        print(f"[resolve] HTTP {r.status_code}: {r.text[:120]}", flush=True)
+
+        if r.status_code != 200:
+            log(f"[resolve] HTTP {r.status_code}: {r.text[:160]}")
+            return None
+
+        data = r.json()
+        if data.get("status") != "ok":
+            log(f"[resolve] non-ok: {str(data)[:160]}")
+            return None
+
+        return data
+
+    except httpx.TimeoutException:
+        log(f"[resolve] timeout after {RESOLVE_TIMEOUT}s")
+        return None
     except Exception as e:
-        print(f"[resolve] {type(e).__name__}: {e}", flush=True)
-    return None
-
-
-async def resolve_background(pid: str):
-    """
-    Background resolver. Runs as its own task. Writes the result back to
-    the pipeline state so the next tick can post it.
-    """
-    state = await load_state_from_db()
-    p = None
-    for x in state.get("pipelines", []):
-        if x["id"] == pid:
-            p = x
-            break
-    if not p:
-        return
-
-    stage = p.get("current", {}).get("stage")
-    if stage != "resolving":
-        return   # someone else already moved it forward
-
-    source_url = p.get("current", {}).get("url")
-    if not source_url:
-        return
-
-    _log(state, pid, f"[bg] resolving {source_url[:60]}...")
-
-    result = await _resolve_call(source_url)
-
-    # Re-read state — the sync tick may have advanced it while we were waiting
-    state = await load_state_from_db()
-    p = None
-    for x in state.get("pipelines", []):
-        if x["id"] == pid:
-            p = x
-            break
-    if not p:
-        return
-
-    # Only write the result if the pipeline is still waiting for it
-    if p.get("current", {}).get("stage") != "resolving":
-        return
-
-    if not result:
-        _log(state, pid, "❌ [bg] resolve failed")
-        p["current"] = None
-        p["cursor"] = int(p.get("cursor") or 0) + 1
-        p["failed_count"] = int(p.get("failed_count") or 0) + 1
-        p["status"] = "scheduled"
-        # Schedule the next slot
-        try:
-            nxt = next_slot_after_pipeline(p, state, now_utc())
-            p["next_slot"] = utc_iso(nxt)
-            p["next_slot_nairobi"] = nairobi_iso(nxt)
-            p["upcoming_slots"] = upcoming_slots_for_pipeline(
-                p, state, min(10, len(p.get("urls") or []) * 2))
-        except Exception:
-            pass
-        await persist(state)
-        return
-
-    _log(state, pid, f"✅ [bg] resolved → {result.get('filename')}")
-    p["current"] = {
-        "stage": "ready",
-        "url": source_url,
-        "download_url": result["download_url"],
-        "filename": result.get("filename", "video.mp4"),
-    }
-    p["status"] = "scheduled"
-    p["next_slot"] = utc_iso(now_utc())   # fire as soon as possible
-    p["next_slot_nairobi"] = nairobi_iso(now_utc())
-    await persist(state)
+        log(f"[resolve] {type(e).__name__}: {e}")
+        return None
 
 
 # ==================================================================
-# Post to Buffer
+# Buffer post
 # ==================================================================
 async def post_to_buffer(state: dict, video_url: str, source_url: str,
-                         channel_id: str, template: str) -> bool:
+                         channel_id: str, template: str, log) -> bool:
     text = template.replace("{source_url}", source_url).strip()[:2200] or source_url[:280]
     key = get_buffer_key(state)
 
     if not key:
+        log("[post] no Buffer API key")
         return False
 
     for attempt in range(1, POST_RETRIES + 1):
         try:
-            await create_post(
+            result = await create_post(
                 key=key,
                 channel_id=channel_id,
                 text=text,
                 video_url=video_url,
                 mode="shareNow",
             )
+            pid = (result.get("id") or "?")[:8]
+            log(f"[post] ✅ published id={pid}")
             return True
         except BufferError as e:
-            print(f"[post] {attempt}/{POST_RETRIES}: {e}", flush=True)
+            log(f"[post] attempt {attempt}: {e}")
         except Exception as e:
-            print(f"[post] {attempt}/{POST_RETRIES}: {type(e).__name__}: {e}", flush=True)
+            log(f"[post] attempt {attempt}: {type(e).__name__}: {e}")
+
         if attempt < POST_RETRIES:
-            await asyncio.sleep(POST_BACKOFF * attempt)
+            await asyncio.sleep(3 * attempt)
+
     return False
 
 
 # ==================================================================
-# Due pipeline discovery
+# Due discovery
 # ==================================================================
 def find_due_pipelines(state: dict) -> list[str]:
     now = now_utc()
-    stuck_before = now - timedelta(minutes=3)
-    resolve_stale = now - timedelta(seconds=RESOLVE_STALE_SEC)
+    stuck_before = now - timedelta(minutes=5)
     due = []
 
     for p in state.get("pipelines", []):
@@ -439,17 +383,10 @@ def find_due_pipelines(state: dict) -> list[str]:
         except Exception:
             continue
 
-        # A pipeline stuck in "running" > 3 min → crashed. Reset.
+        # If a "running" pipeline is stuck > 5 min, reset it
         if status == "running" and due_at < stuck_before:
             p["status"] = "scheduled"
             p["current"] = None
-
-        # A pipeline stuck "resolving" > RESOLVE_STALE_SEC → assume the
-        # background task died. Reset so we try again.
-        stage = (p.get("current") or {}).get("stage")
-        if stage == "resolving" and due_at < resolve_stale:
-            p["current"] = None
-            p["status"] = "scheduled"
 
         if due_at <= now:
             due.append(p["id"])
@@ -458,39 +395,36 @@ def find_due_pipelines(state: dict) -> list[str]:
 
 
 # ==================================================================
-# Sync tick — kicks off resolve as background, posts when ready
+# fire_one — the whole job: resolve → post → advance
 # ==================================================================
 async def fire_one(state: dict, p: dict) -> dict:
-    """
-    Called by tick.
-    - If current.stage == "ready" → post to Buffer now
-    - Otherwise → start the resolve as a background task and return
-    """
     pid = p["id"]
     urls = p.get("urls") or []
     cursor = int(p.get("cursor") or 0)
-    stage = (p.get("current") or {}).get("stage")
 
-    # --- Case 1: already resolved, just post ---
-    if stage == "ready":
-        cur = p["current"]
-        video_url = cur["download_url"]
-        filename = cur.get("filename", "video.mp4")
-        source_url = cur["url"]
+    if cursor >= len(urls):
+        p["status"] = "done"
+        p["next_slot"] = None
+        _log(state, pid, "🏁 no more URLs")
+        return {"pipeline": pid, "success": False, "reason": "queue_empty"}
 
-        _log(state, pid, f"⬆ posting {filename}")
-        p["current"] = {"stage": "post", "filename": filename}
-        await persist(state)
+    source_url = urls[cursor]
+    channel_id = p.get("channel_id", "")
+    template = p.get("tweet_template", "")
 
-        ok = await post_to_buffer(
-            state, video_url, source_url,
-            p.get("channel_id", ""),
-            p.get("tweet_template", ""),
-        )
+    _log(state, pid, f"▶ [{cursor+1}/{len(urls)}] {source_url}")
+    p["current"] = {"stage": "resolve", "url": source_url}
+    p["status"] = "running"
+    await persist(state)
 
+    # --- resolve ---
+    log = lambda m: _log(state, pid, m)
+    result = await resolve_one(source_url, log)
+
+    if not result:
+        _log(state, pid, "❌ resolve failed")
         p["cursor"] = cursor + 1
-        p["posted_count"] = int(p.get("posted_count") or 0) + (1 if ok else 0)
-        p["failed_count"] = int(p.get("failed_count") or 0) + (0 if ok else 1)
+        p["failed_count"] = int(p.get("failed_count") or 0) + 1
         p["current"] = None
 
         if p["cursor"] >= len(urls):
@@ -498,7 +432,8 @@ async def fire_one(state: dict, p: dict) -> dict:
             p["next_slot"] = None
             p["upcoming_slots"] = []
             _log(state, pid,
-                 f"🏁 done posted={p['posted_count']} failed={p['failed_count']}")
+                 f"🏁 done posted={p.get('posted_count', 0)} "
+                 f"failed={p['failed_count']}")
         else:
             nxt = next_slot_after_pipeline(p, state, now_utc())
             p["status"] = "scheduled"
@@ -507,32 +442,40 @@ async def fire_one(state: dict, p: dict) -> dict:
             p["upcoming_slots"] = upcoming_slots_for_pipeline(
                 p, state, min(10, (len(urls) - p["cursor"]) * 2))
 
-        _log(state, pid, "✅ posted" if ok else "❌ post failed")
-        return {"pipeline": pid, "fired": True, "success": ok, "filename": filename}
+        await persist(state)
+        return {"pipeline": pid, "success": False, "reason": "resolve_failed"}
 
-    # --- Case 2: nothing resolved yet → queue it and return fast ---
-    if cursor >= len(urls):
+    video_url = result["download_url"]
+    filename = result.get("filename", "video.mp4")
+    _log(state, pid, f"✅ resolved → {filename}")
+    p["current"] = {"stage": "post", "filename": filename}
+    await persist(state)
+
+    # --- post ---
+    ok = await post_to_buffer(state, video_url, source_url,
+                              channel_id, template, log)
+
+    p["cursor"] = cursor + 1
+    p["posted_count"] = int(p.get("posted_count") or 0) + (1 if ok else 0)
+    p["failed_count"] = int(p.get("failed_count") or 0) + (0 if ok else 1)
+    p["current"] = None
+
+    if p["cursor"] >= len(urls):
         p["status"] = "done"
         p["next_slot"] = None
-        _log(state, pid, "🏁 no more URLs")
-        return {"pipeline": pid, "fired": False, "reason": "queue_empty"}
+        p["upcoming_slots"] = []
+        _log(state, pid,
+             f"🏁 done posted={p['posted_count']} failed={p['failed_count']}")
+    else:
+        nxt = next_slot_after_pipeline(p, state, now_utc())
+        p["status"] = "scheduled"
+        p["next_slot"] = utc_iso(nxt)
+        p["next_slot_nairobi"] = nairobi_iso(nxt)
+        p["upcoming_slots"] = upcoming_slots_for_pipeline(
+            p, state, min(10, (len(urls) - p["cursor"]) * 2))
 
-    source_url = urls[cursor]
-
-    _log(state, pid, f"▶ [{cursor+1}/{len(urls)}] {source_url}")
-    p["current"] = {"stage": "resolving", "url": source_url}
-    p["status"] = "running"
-    # Push next_slot forward slightly so we don't retrigger this tick
-    p["next_slot"] = utc_iso(now_utc() + timedelta(seconds=RESOLVE_STALE_SEC))
-    p["next_slot_nairobi"] = nairobi_iso(now_utc() + timedelta(seconds=RESOLVE_STALE_SEC))
-
-    # Start the resolve as a background task. Vercel may cut this off,
-    # but the state is already marked "resolving" so the next tick can
-    # pick it up.
-    asyncio.create_task(resolve_background(pid))
-
-    return {"pipeline": pid, "fired": True, "queued": True,
-            "reason": "resolve_started"}
+    await persist(state)
+    return {"pipeline": pid, "success": ok, "filename": filename}
 
 
 async def fire_pipeline_by_id(pid: str) -> dict:
@@ -543,27 +486,9 @@ async def fire_pipeline_by_id(pid: str) -> dict:
             p = x
             break
     if not p:
-        return {"pipeline": pid, "fired": False, "reason": "not_found"}
+        return {"pipeline": pid, "success": False, "reason": "not_found"}
 
-    if p.get("status") not in ("scheduled", "running"):
-        return {"pipeline": pid, "fired": False, "reason": "not_active"}
-
-    stage = (p.get("current") or {}).get("stage")
-    if stage not in ("ready", "resolving"):
-        # Not mid-work — check due
-        ns = p.get("next_slot")
-        if not ns:
-            return {"pipeline": pid, "fired": False, "reason": "no_slot"}
-        try:
-            due_at = datetime.fromisoformat(ns.replace("Z", "+00:00"))
-        except Exception:
-            return {"pipeline": pid, "fired": False, "reason": "bad_slot"}
-        if due_at > now_utc():
-            return {"pipeline": pid, "fired": False, "reason": "not_due"}
-
-    result = await fire_one(state, p)
-    await persist(state)
-    return result
+    return await fire_one(state, p)
 
 
 # ==================================================================
@@ -607,9 +532,7 @@ async def on_startup():
     for p in state.get("pipelines", []):
         if p.get("status") == "running":
             p["status"] = "scheduled"
-        # Leave "ready" alone — next tick will post it
-        if p.get("current") and p["current"].get("stage") == "resolving":
-            # Was mid-resolve when the process died — clear and retry
+        if p.get("current"):
             p["current"] = None
 
     await persist(state)
