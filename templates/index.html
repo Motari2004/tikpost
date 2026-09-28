@@ -140,7 +140,7 @@
     .pipeline-meta {
       font-size: 11.5px; color: var(--muted);
       margin-top: 2px;
-      display: flex; gap: 8px; flex-wrap: wrap;
+      display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
     }
     .pipeline-meta .dot-sep { opacity: 0.5; }
     .mode-tag {
@@ -320,7 +320,7 @@
     label:first-of-type { margin-top: 0; }
 
     input[type="text"], input[type="password"], input[type="time"],
-    textarea, select {
+    input[type="number"], textarea, select {
       width: 100%; padding: 10px 12px;
       background: var(--bg); color: var(--text);
       border: 1px solid var(--border); border-radius: 8px;
@@ -388,38 +388,33 @@
       color: white;
     }
 
-    .times-list {
-      display: flex; flex-wrap: wrap; gap: 8px;
+    .manual-row {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     }
-    .time-chip {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 6px 10px;
+    .manual-row input[type="time"] { max-width: 150px; }
+    .manual-row input[type="number"] { max-width: 110px; }
+    .manual-row .sym {
+      color: var(--muted); font-size: 13px;
+      font-family: var(--mono);
+    }
+
+    .manual-preview {
+      margin-top: 12px;
+      padding: 10px 12px;
       background: var(--panel-2);
       border: 1px solid var(--border);
       border-radius: 8px;
-      font-family: var(--mono);
       font-size: 12.5px;
-    }
-    .time-chip input[type="time"] {
-      background: transparent;
-      border: none;
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 12.5px;
-      padding: 0;
-      outline: none;
-      width: 90px;
-    }
-    .time-chip button {
-      background: none;
-      border: none;
       color: var(--muted);
-      cursor: pointer;
-      padding: 0;
-      font-size: 14px;
-      line-height: 1;
+      font-family: var(--mono);
     }
-    .time-chip button:hover { color: var(--danger); }
+    .manual-preview code {
+      color: var(--accent);
+      background: transparent;
+      padding: 0;
+      font-size: 12.5px;
+      font-weight: 600;
+    }
 
     .toast {
       position: fixed; bottom: 24px; right: 24px;
@@ -481,7 +476,7 @@
     <div class="modal">
       <h2 id="modal-title">New pipeline</h2>
       <div class="sub">
-        Posts fire at randomized times inside the daily window (6:00 AM–11:00 PM Nairobi), or at your chosen manual times.
+        Two posts per day. Pick random (auto) or set the first slot — the second is derived automatically.
       </div>
 
       <label>Pipeline name</label>
@@ -509,12 +504,17 @@
       </div>
 
       <div id="f-manual-block" style="display:none; margin-top:14px">
-        <label style="margin-top:0">Manual times (Nairobi, 24h)</label>
-        <div id="f-manual-times" class="times-list"></div>
-        <div class="row" style="margin-top:8px; display:flex; gap:8px">
-          <button type="button" class="ghost small" onclick="addManualTime()">+ Add time</button>
+        <label style="margin-top:0">First slot (Nairobi) + gap to second slot</label>
+        <div class="manual-row">
+          <input type="time" id="f-manual-first" value="09:00" />
+          <span class="sym">+</span>
+          <input type="number" id="f-manual-gap" min="120" max="720" step="15" value="240" />
+          <span class="sym">min</span>
         </div>
-        <div class="hint">Times are the same every day. Add as many as you want.</div>
+        <div class="manual-preview" id="f-manual-preview">—</div>
+        <div class="hint">
+          Gap must be between 2 and 12 hours. The second slot = first + gap.
+        </div>
       </div>
 
       <label>URLs</label>
@@ -583,6 +583,14 @@
       const suffix = hh < 12 ? 'AM' : 'PM';
       const h12 = hh % 12 || 12;
       return `${h12}:${String(mm).padStart(2, '0')} ${suffix}`;
+    }
+
+    function addMinutesHhmm(hhmm, minutes) {
+      const [h, m] = hhmm.split(':').map(Number);
+      const total = (h * 60 + m + minutes) % (24 * 60);
+      const h2 = Math.floor(total / 60);
+      const m2 = total % 60;
+      return `${String(h2).padStart(2, '0')}:${String(m2).padStart(2, '0')}`;
     }
 
     function humanizeSeconds(sec) {
@@ -774,9 +782,15 @@
         ? `<span class="mode-tag manual">🕐 manual</span>`
         : `<span class="mode-tag random">🎲 random</span>`;
 
-      const modeMeta = mode === 'manual'
-        ? `manual · ${(p.manual_times || []).map(to12h).join(', ') || '—'}`
-        : `random · 2/day · 6:00 AM–11:00 PM`;
+      let modeMeta;
+      if (mode === 'manual') {
+        const first = p.manual_first || '09:00';
+        const gap = p.manual_gap_min || 240;
+        const second = addMinutesHhmm(first, gap);
+        modeMeta = `manual · ${to12h(first)} + ${gap}m → ${to12h(second)}`;
+      } else {
+        modeMeta = `random · 2/day · 6:00 AM–11:00 PM`;
+      }
 
       const nextSlot = p.next_slot;
       const now = Date.now();
@@ -908,40 +922,26 @@
         b.classList.toggle('active', b.dataset.mode === mode);
       });
       $('f-manual-block').style.display = mode === 'manual' ? 'block' : 'none';
-      const hint = $('f-schedule-hint');
-      hint.textContent = mode === 'manual'
-        ? 'Manual: choose the exact times (Nairobi) posts will fire each day.'
+      $('f-schedule-hint').textContent = mode === 'manual'
+        ? 'Manual: you set the first slot. The second is derived from the gap.'
         : 'Random: 2 posts/day auto-picked inside 6:00 AM–11:00 PM Nairobi.';
+      updateManualPreview();
+    }
+
+    function updateManualPreview() {
+      const first = $('f-manual-first').value || '09:00';
+      let gap = parseInt($('f-manual-gap').value || '240', 10);
+      if (isNaN(gap)) gap = 240;
+      const second = addMinutesHhmm(first, gap);
+      $('f-manual-preview').innerHTML =
+        `Today's slots: <code>${to12h(first)}</code> and <code>${to12h(second)}</code> (Nairobi)`;
     }
 
     document.querySelectorAll('#f-schedule-mode .seg-btn').forEach(b => {
       b.addEventListener('click', () => setScheduleMode(b.dataset.mode));
     });
-
-    function addManualTime(value = '') {
-      const wrap = $('f-manual-times');
-      const chip = document.createElement('div');
-      chip.className = 'time-chip';
-      chip.innerHTML = `
-        <input type="time" value="${value}" />
-        <button type="button" title="Remove">✕</button>
-      `;
-      chip.querySelector('button').addEventListener('click', () => chip.remove());
-      wrap.appendChild(chip);
-    }
-
-    function getManualTimes() {
-      return [...document.querySelectorAll('#f-manual-times input[type="time"]')]
-        .map(i => i.value)
-        .filter(Boolean);
-    }
-
-    function renderManualTimes(times) {
-      const wrap = $('f-manual-times');
-      wrap.innerHTML = '';
-      (times || []).forEach(t => addManualTime(t));
-      if (!times || times.length === 0) addManualTime('09:00');
-    }
+    $('f-manual-first').addEventListener('input', updateManualPreview);
+    $('f-manual-gap').addEventListener('input', updateManualPreview);
 
     // ---------- Modal ----------
     function openCreateModal() {
@@ -952,8 +952,10 @@
       $('f-channel').value = '';
       $('f-template').value = '';
       $('f-urls').value = '';
+      $('f-manual-first').value = '09:00';
+      $('f-manual-gap').value = '240';
       setScheduleMode('random');
-      renderManualTimes([]);
+      updateManualPreview();
       updateUrlCount();
       loadChannels();
       $('modal-backdrop').classList.add('open');
@@ -968,8 +970,10 @@
       $('f-name').value = p.name || '';
       $('f-template').value = p.tweet_template || '';
       $('f-urls').value = (p.urls || []).join('\n');
+      $('f-manual-first').value = p.manual_first || '09:00';
+      $('f-manual-gap').value = p.manual_gap_min || 240;
       setScheduleMode(p.schedule_mode || 'random');
-      renderManualTimes(p.manual_times || []);
+      updateManualPreview();
       updateUrlCount();
       loadChannels().then(() => { $('f-channel').value = p.channel_id || ''; });
       $('modal-backdrop').classList.add('open');
@@ -985,17 +989,22 @@
       const tweet_template = $('f-template').value;
       const urls = $('f-urls').value.split('\n').map(u => u.trim()).filter(Boolean);
       const schedule_mode = currentScheduleMode;
-      const manual_times = schedule_mode === 'manual' ? getManualTimes() : [];
+      const manual_first = $('f-manual-first').value || '09:00';
+      let manual_gap_min = parseInt($('f-manual-gap').value || '240', 10);
+      if (isNaN(manual_gap_min)) manual_gap_min = 240;
 
       if (!channel_id) return toast('Pick a TikTok channel', 'err');
       if (!urls.length) return toast('Add at least one URL', 'err');
-      if (schedule_mode === 'manual' && !manual_times.length) {
-        return toast('Add at least one manual time', 'err');
+      if (schedule_mode === 'manual' && !manual_first) {
+        return toast('Set a first slot time', 'err');
+      }
+      if (schedule_mode === 'manual' && (manual_gap_min < 120 || manual_gap_min > 720)) {
+        return toast('Gap must be 120–720 minutes', 'err');
       }
 
       const body = JSON.stringify({
         name, channel_id, tweet_template, urls,
-        schedule_mode, manual_times,
+        schedule_mode, manual_first, manual_gap_min,
       });
       const path = editingId ? `/api/pipelines/${editingId}` : '/api/pipelines';
       const method = editingId ? 'PUT' : 'POST';

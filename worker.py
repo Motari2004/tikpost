@@ -20,10 +20,11 @@ POST_BACKOFF = float(os.getenv("BUFFER_RETRY_DELAY", "10"))
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
 
-WINDOW_START  = (6, 0)
-WINDOW_END    = (23, 0)
+WINDOW_START  = (6, 0)    # 6:00 AM
+WINDOW_END    = (23, 0)   # 11:00 PM
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120
+DEFAULT_MANUAL_GAP_MIN = 240   # 4h
 
 
 # ==================================================================
@@ -126,15 +127,35 @@ def _today_local_str() -> str:
 
 
 def _validate_hhmm(t: str) -> str:
-    """Normalize a time string like '9:00' → '09:00'. Raise on bad input."""
-    t = t.strip()
+    t = (t or "").strip()
     if ":" not in t:
-        raise ValueError(f"Invalid time: {t}")
+        raise ValueError(f"Invalid time: {t!r}")
     h, m = t.split(":")
     h, m = int(h), int(m)
     if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError(f"Invalid time: {t}")
+        raise ValueError(f"Invalid time: {t!r}")
     return f"{h:02d}:{m:02d}"
+
+
+def _add_minutes_hhmm(hhmm: str, minutes: int) -> str:
+    """'09:00' + 240 → '13:00' (wraps past midnight if needed)."""
+    h, m = hhmm.split(":")
+    total = int(h) * 60 + int(m) + minutes
+    total %= 24 * 60
+    h2, m2 = divmod(total, 60)
+    return f"{h2:02d}:{m2:02d}"
+
+
+def _derive_manual_times(first_hhmm: str, gap_min: int) -> list[str]:
+    """
+    Given the first slot, produce the full list of HH:MM times for the day.
+    POSTS_PER_DAY=2 → [first, first+gap].
+    """
+    first = _validate_hhmm(first_hhmm)
+    if POSTS_PER_DAY == 1:
+        return [first]
+    second = _add_minutes_hhmm(first, gap_min)
+    return [first, second]
 
 
 # ==================================================================
@@ -216,28 +237,23 @@ def today_slots_utc() -> list[datetime]:
 
 
 def _times_for_pipeline(p: dict) -> list[str]:
-    """Return the HH:MM times this pipeline should use, per its mode."""
-    mode = p.get("schedule_mode", "random")
+    """Return the two HH:MM times this pipeline should use today."""
+    mode = (p.get("schedule_mode") or "random").lower()
     if mode == "manual":
-        times = p.get("manual_times") or []
-        return [_validate_hhmm(t) for t in times]
-    # random → today's rolled slots
+        first = p.get("manual_first") or "09:00"
+        gap   = int(p.get("manual_gap_min") or DEFAULT_MANUAL_GAP_MIN)
+        return _derive_manual_times(first, gap)
+    # random → use today's rolled slots
     return ensure_slots_for_today()["times"]
 
 
 def daily_slots_for_pipeline(p: dict, day) -> list[datetime]:
-    """
-    Compute the UTC datetimes for a pipeline's slots on a given local day.
-    Manual times are the same every day; random uses the day-specific roll.
-    """
     today_local = now_utc().astimezone(NAIROBI).date()
-    mode = p.get("schedule_mode", "random")
+    mode = (p.get("schedule_mode") or "random").lower()
 
     if mode == "manual":
-        times = [_validate_hhmm(t) for t in (p.get("manual_times") or [])]
-        return [_parse_hhmm_on(day, t).astimezone(UTC) for t in sorted(times)]
+        return [_parse_hhmm_on(day, t).astimezone(UTC) for t in _times_for_pipeline(p)]
 
-    # random: today uses state, future days are simulated + cached
     if day == today_local:
         return today_slots_utc()
 
@@ -287,7 +303,7 @@ def upcoming_slots_for_pipeline(p: dict, count: int,
 
 
 def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
-    """Global slot preview (random roll for the site's default)."""
+    """Global random preview (used on the window strip)."""
     after = after_utc or now_utc()
     out = []
     cursor = after
@@ -435,7 +451,7 @@ class PipelineRunner:
         urls       = p.get("urls") or []
         channel_id = p.get("channel_id", "")
         template   = p.get("tweet_template", "")
-        mode       = p.get("schedule_mode", "random")
+        mode       = (p.get("schedule_mode") or "random").lower()
 
         if not channel_id:
             self.log("❌ no channel selected")
@@ -450,27 +466,22 @@ class PipelineRunner:
             update_pipeline(self.pid, status="failed")
             return
 
-        # Validate manual times if that mode is on
         if mode == "manual":
             try:
-                times = [_validate_hhmm(t) for t in (p.get("manual_times") or [])]
+                times = _times_for_pipeline(p)
             except ValueError as e:
                 self.log(f"❌ invalid manual time: {e}")
                 update_pipeline(self.pid, status="failed")
                 return
-            if not times:
-                self.log("❌ manual mode selected but no times set")
-                update_pipeline(self.pid, status="failed")
-                return
-            pretty = ", ".join(_hhmm_to_12h(t) for t in sorted(times))
-            self.log(f"🗓 schedule: manual · {pretty} (Nairobi) · {len(urls)} URLs")
+            pretty = ", ".join(_hhmm_to_12h(t) for t in times)
+            gap = int(p.get("manual_gap_min") or DEFAULT_MANUAL_GAP_MIN)
+            self.log(f"🗓 schedule: manual · first {_hhmm_to_12h(times[0])} "
+                     f"+{gap}m → {pretty} (Nairobi)")
         else:
             ensure_slots_for_today()
             slots_today = _STATE["slots"]["times"]
             pretty = ", ".join(_hhmm_to_12h(t) for t in slots_today)
-            self.log(
-                f"🗓 schedule: random · today's slots: {pretty} (Nairobi)"
-            )
+            self.log(f"🗓 schedule: random · today: {pretty} (Nairobi)")
 
         preview = upcoming_slots_for_pipeline(p, min(10, len(urls) * 2))
         update_pipeline(self.pid, upcoming_slots=preview)
@@ -483,7 +494,6 @@ class PipelineRunner:
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             while slot_index < len(urls) and not self.cancel:
-                # Re-read pipeline each iteration in case user edits times
                 p = find_pipeline(self.pid)
                 slot_time = next_slot_after_pipeline(p, now_utc())
                 nairobi_time = slot_time.astimezone(NAIROBI)
