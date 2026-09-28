@@ -265,6 +265,47 @@ def roll_one_slot(exclude: str | None = None) -> str:
 
 
 # ==================================================================
+# Pipeline reroll helpers
+# ==================================================================
+def reschedule_pipeline(p: dict, state: dict) -> bool:
+    """
+    Recompute the pipeline's next_slot and upcoming_slots from
+    the current state (respecting its schedule_mode).
+    Returns True on success.
+    """
+    try:
+        nxt = next_slot_after_pipeline(p, state, now_utc())
+        p["next_slot"] = utc_iso(nxt)
+        p["next_slot_nairobi"] = nairobi_iso(nxt)
+        p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
+        return True
+    except Exception as e:
+        print(f"[reschedule] {p.get('id', '?')[:8]}: {e}", flush=True)
+        return False
+
+
+def reroll_pipeline_slot(p: dict) -> str | None:
+    """
+    Pick a fresh random time inside the window that is still in the future
+    today (Nairobi). Returns an ISO UTC string, or None if no slot available.
+    """
+    now_local = now_utc().astimezone(NAIROBI)
+    start_min = _minutes(*WINDOW_START)
+    end_min   = _minutes(*WINDOW_END)
+    now_min   = now_local.hour * 60 + now_local.minute
+
+    # Any candidate must be > now and leave room for MIN_GAP_MIN
+    lower = max(start_min, now_min + 2)
+    upper = end_min - MIN_GAP_MIN
+    if lower >= upper:
+        return None
+
+    h, m = divmod(random.randint(lower, upper), 60)
+    target_local = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+    return utc_iso(target_local.astimezone(UTC))
+
+
+# ==================================================================
 # Key
 # ==================================================================
 def get_buffer_key(state: dict) -> str:
@@ -510,13 +551,10 @@ async def daily_roll() -> dict:
 
     s = reroll_slots_today(state)
 
+    # Push new slots into every active pipeline
     for p in state.get("pipelines", []):
-        try:
-            if p.get("status") in ("scheduled", "running", "pending"):
-                p["upcoming_slots"] = upcoming_slots_for_pipeline(
-                    p, state, min(10, len(p.get("urls") or []) * 2))
-        except Exception:
-            p["upcoming_slots"] = []
+        if p.get("status") in ("scheduled", "running", "pending"):
+            reschedule_pipeline(p, state)
 
     await persist(state)
 

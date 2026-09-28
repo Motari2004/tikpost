@@ -6,7 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -17,6 +17,7 @@ from worker import (
     load_state_from_db, persist,
     upcoming_slots, upcoming_slots_for_pipeline,
     ensure_slots_for_today, reroll_slots_today,
+    reschedule_pipeline, reroll_pipeline_slot,
     get_buffer_key, daily_roll, roll_one_slot, on_startup,
     find_due_pipelines, fire_pipeline_by_id,
     next_slot_after_pipeline,
@@ -147,15 +148,11 @@ async def status():
 
 
 # ==================================================================
-# CRON ENDPOINT 1 — tick (fast, dispatches work, returns)
+# CRON 1 — tick (fast, dispatches work, returns)
 # ==================================================================
 @app.get("/api/cron/tick")
 @app.post("/api/cron/tick")
 async def cron_tick():
-    """
-    Fast. Marks due pipelines as pending, dispatches /api/internal/work,
-    returns immediately. Never runs resolve or post inline.
-    """
     state = await load_state_from_db()
     state["last_tick"] = now_utc().isoformat()
     state["tick_count"] = int(state.get("tick_count") or 0) + 1
@@ -171,7 +168,6 @@ async def cron_tick():
                     await client.post(f"{_self_base()}/api/internal/work")
                     dispatched.append("ok")
                 except httpx.TimeoutException:
-                    # Expected: work is still running on Vercel. That's fine.
                     dispatched.append("dispatched")
         except Exception as e:
             print(f"[tick] dispatch failed: {type(e).__name__}: {e}",
@@ -187,7 +183,7 @@ async def cron_tick():
 
 
 # ==================================================================
-# CRON ENDPOINT 2 — daily-roll
+# CRON 2 — daily-roll
 # ==================================================================
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
@@ -201,10 +197,6 @@ async def cron_daily_roll():
 @app.post("/api/internal/work")
 @app.get("/api/internal/work")
 async def internal_work():
-    """
-    Slow. Picks up ONE pending pipeline and does the resolve + post.
-    Runs as its own Vercel function with its own timeout budget.
-    """
     state = await load_state_from_db()
 
     pending = [
@@ -218,7 +210,6 @@ async def internal_work():
 
     p = pending[0]
 
-    # Re-read to avoid double-fire from stale list
     state = await load_state_from_db()
     fresh = None
     for x in state.get("pipelines", []):
@@ -293,6 +284,9 @@ async def clear_buffer_key():
     return {"ok": True}
 
 
+# ==================================================================
+# Slots
+# ==================================================================
 @app.get("/api/slots")
 async def slots(count: int = 10):
     s = await load_state_from_db()
@@ -301,10 +295,27 @@ async def slots(count: int = 10):
 
 @app.post("/api/slots/reroll")
 async def slots_reroll():
-    s = await load_state_from_db()
-    slots = reroll_slots_today(s)
-    await persist(s)
-    return {"ok": True, "slots": slots}
+    """
+    Global reroll — regenerates today's random pair AND updates every
+    active pipeline's next_slot so the UI reflects the new times.
+    """
+    state = await load_state_from_db()
+    slots = reroll_slots_today(state)
+
+    updated = []
+    for p in state.get("pipelines", []):
+        if p.get("status") not in ("scheduled", "running", "pending"):
+            continue
+        if reschedule_pipeline(p, state):
+            updated.append(p["id"])
+
+    await persist(state)
+
+    return {
+        "ok": True,
+        "slots": slots,
+        "updated_pipelines": updated,
+    }
 
 
 @app.get("/api/random-slot")
@@ -312,6 +323,50 @@ async def random_slot(exclude: str = ""):
     return {"time": roll_one_slot(exclude or None)}
 
 
+# ==================================================================
+# Per-pipeline reroll
+# ==================================================================
+@app.post("/api/pipelines/{pid}/reroll")
+async def pipeline_reroll(pid: str):
+    """
+    Reroll one pipeline's next slot. Only works for random-mode pipelines
+    (manual pipelines have fixed times).
+    """
+    state = await load_state_from_db()
+    p = find_pipeline_in(state, pid)
+    if not p:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    if (p.get("schedule_mode") or "random").lower() == "manual":
+        return JSONResponse(
+            {"ok": False, "error": "manual pipelines have fixed slots"},
+            status_code=400,
+        )
+
+    if p.get("status") not in ("scheduled", "running", "pending"):
+        return JSONResponse(
+            {"ok": False, "error": "pipeline is not active"},
+            status_code=400,
+        )
+
+    new_slot = reroll_pipeline_slot(p)
+    if not new_slot:
+        return JSONResponse(
+            {"ok": False, "error": "no room left today for a new slot"},
+            status_code=400,
+        )
+
+    p["next_slot"] = new_slot
+    # Recompute the preview list from the new next_slot
+    p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
+    await persist(state)
+
+    return {"ok": True, "next_slot": new_slot}
+
+
+# ==================================================================
+# Pipelines CRUD
+# ==================================================================
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     try:
@@ -367,11 +422,7 @@ async def update_pipeline_route(pid: str, data: PipelineInput):
     p["manual_slot2"] = s2
 
     if p.get("status") in ("scheduled", "running", "pending"):
-        try:
-            p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
-            p["next_slot"] = utc_iso(next_slot_after_pipeline(p, state, now_utc()))
-        except Exception:
-            pass
+        reschedule_pipeline(p, state)
 
     await persist(state)
     return {"ok": True, "pipeline": p}
@@ -438,6 +489,9 @@ async def pipeline_reset(pid: str):
     return {"ok": True}
 
 
+# ==================================================================
+# Channels
+# ==================================================================
 @app.get("/api/channels")
 async def channels():
     s = await load_state_from_db()
@@ -453,6 +507,9 @@ async def channels():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ==================================================================
+# Upload
+# ==================================================================
 @app.post("/api/upload")
 async def upload_json(file: UploadFile = File(...)):
     import json as _json
@@ -473,6 +530,9 @@ async def upload_json(file: UploadFile = File(...)):
     return {"ok": True, "urls": urls, "count": len(urls)}
 
 
+# ==================================================================
+# Local dev
+# ==================================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))

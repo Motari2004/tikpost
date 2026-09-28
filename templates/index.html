@@ -143,6 +143,7 @@
     }
     .pipeline.scheduled { border-color: rgba(74,144,226,0.4); }
     .pipeline.running { border-color: rgba(53,196,107,0.5); }
+    .pipeline.pending { border-color: rgba(240,165,0,0.5); }
     .pipeline.done { border-color: rgba(53,196,107,0.25); opacity: 0.9; }
     .pipeline.failed { border-color: rgba(226,85,85,0.4); }
     .pipeline.stopped { border-color: rgba(240,165,0,0.35); }
@@ -183,6 +184,7 @@
       animation: pulse 1.5s infinite;
     }
     .status-badge.scheduled { background: rgba(74,144,226,0.15); color: var(--accent); }
+    .status-badge.pending { background: rgba(240,165,0,0.15); color: var(--warn); }
     .status-badge.done { background: rgba(53,196,107,0.15); color: var(--success); }
     .status-badge.failed { background: rgba(226,85,85,0.15); color: var(--danger); }
     .status-badge.stopped { background: rgba(240,165,0,0.15); color: var(--warn); }
@@ -221,7 +223,8 @@
     .upcoming-title {
       font-size: 11px; color: var(--muted);
       text-transform: uppercase; letter-spacing: 0.06em;
-      font-weight: 600; margin-bottom: 8px;
+      font-weight: 600;
+      margin-bottom: 8px;
       display: flex; align-items: center; justify-content: space-between;
     }
     .upcoming-list {
@@ -234,7 +237,8 @@
     }
     .upcoming-item.next {
       background: rgba(74,144,226,0.1);
-      color: var(--accent); font-weight: 700;
+      color: var(--accent);
+      font-weight: 700;
     }
     .upcoming-item.past { opacity: 0.4; }
     .upcoming-item .idx {
@@ -693,13 +697,24 @@
     }
 
     async function rerollSlots() {
-      if (!confirm('Roll new random slots for today?')) return;
+      if (!confirm('Roll new random slots for today? This will reschedule all active pipelines.')) return;
       const r = await api('/api/slots/reroll', { method: 'POST' });
       if (r.ok) {
-        toast('New random slots generated', 'ok');
+        toast(`Rerolled · ${r.updated_pipelines?.length || 0} pipeline(s) updated`, 'ok');
         refresh();
       } else {
-        toast('Reroll failed', 'err');
+        toast(r.error || 'Reroll failed', 'err');
+      }
+    }
+
+    async function rerollPipeline(pid) {
+      if (!confirm('Reroll this pipeline\'s next slot?')) return;
+      const r = await api(`/api/pipelines/${pid}/reroll`, { method: 'POST' });
+      if (r.ok) {
+        toast('Pipeline rerolled', 'ok');
+        refresh();
+      } else {
+        toast(r.error || 'Reroll failed', 'err');
       }
     }
 
@@ -808,7 +823,7 @@
       const failed = p.failed_count || 0;
       const pct = total ? Math.min(100, (cursor / total) * 100) : 0;
       const st = statusClass(p.status);
-      const isActive = p.status === 'scheduled' || p.status === 'running';
+      const isActive = p.status === 'scheduled' || p.status === 'running' || p.status === 'pending';
 
       const mode = p.schedule_mode || 'random';
       const modeTag = mode === 'manual'
@@ -908,6 +923,9 @@
           ${isActive
             ? `<button class="danger small" onclick="stopPipeline('${p.id}')">■ Stop</button>`
             : `<button class="small" onclick="startPipeline('${p.id}')">▶ Start</button>`}
+          ${mode === 'random' && isActive
+            ? `<button class="ghost small" onclick="rerollPipeline('${p.id}')" title="Pick a new next slot">🎲 Reroll</button>`
+            : ''}
           <button class="ghost small" onclick="editPipeline('${p.id}')">✎ Edit</button>
           <button class="ghost small" onclick="resetPipeline('${p.id}')">↺ Reset</button>
           <button class="danger small" onclick="deletePipeline('${p.id}')">🗑 Delete</button>
