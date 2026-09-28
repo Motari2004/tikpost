@@ -10,12 +10,13 @@ import httpx
 from buffer import create_post, BufferError
 from db import read_state, write_state
 
-API_BASE        = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
-API_KEY         = os.getenv("API_KEY", "")
-RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "55"))
+API_BASE           = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
+API_KEY            = os.getenv("API_KEY", "")
+RESOLVE_TIMEOUT    = float(os.getenv("RESOLVE_TIMEOUT", "55"))
 TRANSCRIPT_TIMEOUT = float(os.getenv("TRANSCRIPT_TIMEOUT", "90"))
-POST_RETRIES    = int(os.getenv("BUFFER_RETRY_MAX", "1"))
-POST_BACKOFF    = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
+POST_RETRIES       = int(os.getenv("BUFFER_RETRY_MAX", "1"))
+POST_BACKOFF       = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
+MAX_URL_RETRIES    = int(os.getenv("MAX_URL_RETRIES", "3"))
 
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
@@ -317,6 +318,26 @@ def _log(state: dict, pid: str, msg: str):
 
 
 # ==================================================================
+# Retry tracking (per-URL)
+# ==================================================================
+def _get_retry_count(p: dict, source_url: str) -> int:
+    retries = p.get("retries") or {}
+    return int(retries.get(source_url, 0))
+
+
+def _bump_retry(p: dict, source_url: str) -> int:
+    p.setdefault("retries", {})
+    p["retries"][source_url] = int(p["retries"].get(source_url, 0)) + 1
+    return p["retries"][source_url]
+
+
+def _clear_retry(p: dict, source_url: str):
+    retries = p.get("retries") or {}
+    if source_url in retries:
+        del retries[source_url]
+
+
+# ==================================================================
 # Resolve
 # ==================================================================
 async def resolve_one(url: str, log) -> dict | None:
@@ -359,10 +380,6 @@ async def resolve_one(url: str, log) -> dict | None:
 # Transcript
 # ==================================================================
 async def fetch_transcript(source_url: str, log) -> str | None:
-    """
-    Ask the resolver for the video's transcript.
-    Returns the transcript text, or None on any failure.
-    """
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["X-API-Key"] = API_KEY
@@ -429,15 +446,6 @@ def _apply_tokens(text: str, p: dict, cursor: int, source_url: str) -> str:
 
 def build_caption(p: dict, cursor: int, source_url: str,
                   transcript: str | None) -> str:
-    """
-    Caption priority:
-      1. Transcript (if use_transcript and non-empty)
-      2. Per-URL caption (if set for this URL)
-      3. Pool (random pick)
-      4. Template
-      5. Fallback: source URL
-    """
-    # 1. transcript
     if p.get("use_transcript", True) and transcript and transcript.strip():
         cap = transcript.strip()
         limit = int(p.get("transcript_max_chars") or 2000)
@@ -447,24 +455,20 @@ def build_caption(p: dict, cursor: int, source_url: str,
             cap = f"{cap}\n\n{source_url}"
         return _apply_tokens(cap, p, cursor, source_url)
 
-    # 2. per-URL caption
     captions = p.get("captions") or []
     if isinstance(captions, list) and cursor < len(captions):
         per_url = (captions[cursor] or "").strip()
         if per_url:
             return _apply_tokens(per_url, p, cursor, source_url)
 
-    # 3. pool
     pool = p.get("caption_pool") or []
     if pool:
         return _apply_tokens(random.choice(pool), p, cursor, source_url)
 
-    # 4. template
     template = p.get("tweet_template") or ""
     if template.strip():
         return _apply_tokens(template, p, cursor, source_url)
 
-    # 5. fallback
     return source_url[:280]
 
 
@@ -558,8 +562,13 @@ async def fire_one(state: dict, p: dict) -> dict:
 
     source_url = urls[cursor]
     log = lambda m: _log(state, pid, m)
+    attempt = _get_retry_count(p, source_url) + 1
 
-    _log(state, pid, f"▶ [{cursor+1}/{len(urls)}] {source_url}")
+    _log(
+        state, pid,
+        f"▶ [{cursor+1}/{len(urls)}] {source_url}"
+        + (f" (attempt {attempt}/{MAX_URL_RETRIES})" if attempt > 1 else ""),
+    )
     p["current"] = {"stage": "resolve", "url": source_url}
     p["status"] = "running"
     await persist(state)
@@ -568,7 +577,26 @@ async def fire_one(state: dict, p: dict) -> dict:
     result = await resolve_one(source_url, log)
 
     if not result:
-        _log(state, pid, "❌ resolve failed")
+        new_count = _bump_retry(p, source_url)
+
+        if new_count < MAX_URL_RETRIES:
+            _log(state, pid,
+                 f"⏳ resolve failed (attempt {new_count}/{MAX_URL_RETRIES}) "
+                 f"— will retry")
+            p["current"] = None
+            p["status"] = "scheduled"
+            nxt = next_slot_after_pipeline(p, state, now_utc())
+            p["next_slot"] = utc_iso(nxt)
+            p["next_slot_nairobi"] = nairobi_iso(nxt)
+            p["upcoming_slots"] = upcoming_slots_for_pipeline(
+                p, state, min(10, (len(urls) - cursor) * 2))
+            await persist(state)
+            return {"pipeline": pid, "success": False,
+                    "reason": "resolve_failed_retry", "attempt": new_count}
+
+        _log(state, pid,
+             f"❌ resolve failed after {new_count} attempts — skipping URL")
+        _clear_retry(p, source_url)
         p["cursor"] = cursor + 1
         p["failed_count"] = int(p.get("failed_count") or 0) + 1
         p["current"] = None
@@ -595,10 +623,9 @@ async def fire_one(state: dict, p: dict) -> dict:
     filename = result.get("filename", "video.mp4")
     _log(state, pid, f"✅ resolved → {filename}")
 
-    # ---- 2. transcript (the caption) ----
+    # ---- 2. transcript ----
     transcript = None
     if p.get("use_transcript", True):
-        # check cache first
         cached = (p.get("resolved_transcripts") or {}).get(source_url)
         if cached:
             transcript = cached
@@ -610,7 +637,7 @@ async def fire_one(state: dict, p: dict) -> dict:
             if transcript:
                 p.setdefault("resolved_transcripts", {})[source_url] = transcript
 
-    # ---- 3. build the caption ----
+    # ---- 3. caption ----
     caption = build_caption(p, cursor, source_url, transcript)
     log(f"[caption] {caption[:100]}{'…' if len(caption) > 100 else ''}")
 
@@ -620,9 +647,53 @@ async def fire_one(state: dict, p: dict) -> dict:
 
     ok = await post_to_buffer(state, p, video_url, source_url, caption, log)
 
+    if not ok:
+        new_count = _bump_retry(p, source_url)
+
+        if new_count < MAX_URL_RETRIES:
+            _log(state, pid,
+                 f"⏳ post failed (attempt {new_count}/{MAX_URL_RETRIES}) "
+                 f"— will retry")
+            p["current"] = None
+            p["status"] = "scheduled"
+            nxt = next_slot_after_pipeline(p, state, now_utc())
+            p["next_slot"] = utc_iso(nxt)
+            p["next_slot_nairobi"] = nairobi_iso(nxt)
+            p["upcoming_slots"] = upcoming_slots_for_pipeline(
+                p, state, min(10, (len(urls) - cursor) * 2))
+            await persist(state)
+            return {"pipeline": pid, "success": False,
+                    "reason": "post_failed_retry", "attempt": new_count}
+
+        _log(state, pid,
+             f"❌ post failed after {new_count} attempts — skipping URL")
+        _clear_retry(p, source_url)
+        p["cursor"] = cursor + 1
+        p["failed_count"] = int(p.get("failed_count") or 0) + 1
+        p["current"] = None
+
+        if p["cursor"] >= len(urls):
+            p["status"] = "done"
+            p["next_slot"] = None
+            p["upcoming_slots"] = []
+            _log(state, pid,
+                 f"🏁 done posted={p.get('posted_count', 0)} "
+                 f"failed={p['failed_count']}")
+        else:
+            nxt = next_slot_after_pipeline(p, state, now_utc())
+            p["status"] = "scheduled"
+            p["next_slot"] = utc_iso(nxt)
+            p["next_slot_nairobi"] = nairobi_iso(nxt)
+            p["upcoming_slots"] = upcoming_slots_for_pipeline(
+                p, state, min(10, (len(urls) - p["cursor"]) * 2))
+
+        await persist(state)
+        return {"pipeline": pid, "success": False, "reason": "post_failed"}
+
+    # ---- success ----
+    _clear_retry(p, source_url)
     p["cursor"] = cursor + 1
-    p["posted_count"] = int(p.get("posted_count") or 0) + (1 if ok else 0)
-    p["failed_count"] = int(p.get("failed_count") or 0) + (0 if ok else 1)
+    p["posted_count"] = int(p.get("posted_count") or 0) + 1
     p["current"] = None
 
     if p["cursor"] >= len(urls):
@@ -640,7 +711,7 @@ async def fire_one(state: dict, p: dict) -> dict:
             p, state, min(10, (len(urls) - p["cursor"]) * 2))
 
     await persist(state)
-    return {"pipeline": pid, "success": ok, "filename": filename}
+    return {"pipeline": pid, "success": True, "filename": filename}
 
 
 async def fire_pipeline_by_id(pid: str) -> dict:
