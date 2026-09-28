@@ -422,7 +422,7 @@ async def fetch_transcript(source_url: str, log) -> str | None:
 
 
 # ==================================================================
-# Caption builder
+# Caption builder — transcript verbatim, no URL, no filter
 # ==================================================================
 def _apply_tokens(text: str, p: dict, cursor: int, source_url: str) -> str:
     urls = p.get("urls") or []
@@ -446,24 +446,17 @@ def _apply_tokens(text: str, p: dict, cursor: int, source_url: str) -> str:
 
 def build_caption(p: dict, cursor: int, source_url: str,
                   transcript: str | None) -> str:
-    if p.get("use_transcript", True) and transcript and transcript.strip():
+    """
+    Use whatever the transcript service returns, verbatim.
+    Fall back to the template only if the transcript is completely empty.
+    """
+    if p.get("use_transcript", True) and transcript:
         cap = transcript.strip()
-        limit = int(p.get("transcript_max_chars") or 2000)
-        if limit > 0 and len(cap) > limit:
-            cap = cap[:limit].rsplit(" ", 1)[0] + "…"
-        if p.get("append_source_url", True):
-            cap = f"{cap}\n\n{source_url}"
-        return _apply_tokens(cap, p, cursor, source_url)
-
-    captions = p.get("captions") or []
-    if isinstance(captions, list) and cursor < len(captions):
-        per_url = (captions[cursor] or "").strip()
-        if per_url:
-            return _apply_tokens(per_url, p, cursor, source_url)
-
-    pool = p.get("caption_pool") or []
-    if pool:
-        return _apply_tokens(random.choice(pool), p, cursor, source_url)
+        if cap:
+            limit = int(p.get("transcript_max_chars") or 2200)
+            if limit > 0 and len(cap) > limit:
+                cap = cap[:limit].rsplit(" ", 1)[0] + "…"
+            return _apply_tokens(cap, p, cursor, source_url)
 
     template = p.get("tweet_template") or ""
     if template.strip():
