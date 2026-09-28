@@ -1,12 +1,11 @@
-import asyncio
-import json
 import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -14,51 +13,33 @@ from pydantic import BaseModel
 from buffer import key_check, list_tiktok_channels, BufferError
 from db import init_pool, close_pool
 from worker import (
-    load_state, save_state, find_pipeline, update_pipeline,
-    start_pipeline, stop_pipeline, is_running,
+    load_state_from_db, persist,
     upcoming_slots, upcoming_slots_for_pipeline,
     ensure_slots_for_today, reroll_slots_today,
-    daily_reroll_loop, get_buffer_key,
-    load_state_from_db, persist_now,
-    _today_local_str, _validate_hhmm, roll_one_slot,
+    get_buffer_key, tick, daily_roll, roll_one_slot, on_startup,
+    next_slot_after_pipeline,
+    utc_iso, nairobi_iso, now_utc,
+    _validate_hhmm,
     WINDOW_START, WINDOW_END, POSTS_PER_DAY, MIN_GAP_MIN,
 )
 
-CRON_SECRET  = os.getenv("CRON_SECRET", "").strip()
-MIGRATE_JSON = os.getenv("MIGRATE_STATE_JSON", "1") == "1"
+UTC = ZoneInfo("UTC")
+
+
+def find_pipeline_in(state: dict, pid: str) -> dict | None:
+    for p in state.get("pipelines", []):
+        if p["id"] == pid:
+            return p
+    return None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_pool()
-    await load_state_from_db()
-
-    if MIGRATE_JSON:
-        legacy = Path("data/state.json")
-        if legacy.exists() and not load_state().get("pipelines"):
-            try:
-                old = json.loads(legacy.read_text(encoding="utf-8"))
-                s = load_state()
-                s.update(old)
-                save_state(s)
-                await persist_now()
-                print("[db] migrated data/state.json → Postgres", flush=True)
-            except Exception as e:
-                print(f"[db] migration failed: {e}", flush=True)
-
-    ensure_slots_for_today()
-    await persist_now()
-
-    task = asyncio.create_task(daily_reroll_loop())
-
+    await on_startup()
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
         await close_pool()
 
 
@@ -101,27 +82,14 @@ class BufferKeyInput(BaseModel):
     api_key: str
 
 
-def _check_cron_secret(request: Request):
-    if not CRON_SECRET:
-        return
-    provided = (
-        request.headers.get("x-cron-secret")
-        or request.query_params.get("secret")
-    )
-    if provided != CRON_SECRET:
-        raise HTTPException(status_code=401, detail="invalid cron secret")
-
-
 def _normalize_schedule(data: PipelineInput) -> tuple[str, str, str]:
     mode = (data.schedule_mode or "random").lower()
     if mode not in ("random", "manual"):
         mode = "random"
-
     if mode == "manual":
         s1 = _validate_hhmm(data.manual_slot1 or "09:00")
         s2 = _validate_hhmm(data.manual_slot2 or "13:00")
         return mode, s1, s2
-
     return "random", "09:00", "13:00"
 
 
@@ -140,15 +108,11 @@ async def healthz():
 
 @app.get("/api/status")
 async def status():
-    s = load_state()
-    slots = ensure_slots_for_today()
+    s = await load_state_from_db()
+    slots = ensure_slots_for_today(s)
     out = []
     for p in s["pipelines"]:
-        out.append({
-            **p,
-            "running": is_running(p["id"]),
-            "total": len(p.get("urls") or []),
-        })
+        out.append({**p, "total": len(p.get("urls") or [])})
     return {
         "pipelines": out,
         "window": {
@@ -162,47 +126,27 @@ async def status():
             "times": slots["times"],
             "rolled_at": slots.get("rolled_at"),
         },
+        "last_tick": s.get("last_tick"),
+        "tick_count": s.get("tick_count", 0),
     }
+
+
+@app.get("/api/cron/tick")
+@app.post("/api/cron/tick")
+async def cron_tick():
+    return await tick()
 
 
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
-async def cron_daily_roll(request: Request):
-    _check_cron_secret(request)
-
-    st = load_state()
-    slots = st.get("slots", {})
-    today = _today_local_str()
-
-    if slots.get("day") == today and slots.get("times"):
-        return {"ok": True, "already": True, "day": today, "times": slots["times"]}
-
-    s = reroll_slots_today()
-
-    st = load_state()
-    for p in st["pipelines"]:
-        try:
-            p["upcoming_slots"] = upcoming_slots_for_pipeline(
-                p, min(10, len(p.get("urls") or []) * 2))
-        except Exception:
-            p["upcoming_slots"] = []
-    save_state(st)
-    await persist_now()
-
-    pretty = ", ".join(s["times"])
-    print(f"[cron] daily-roll fired → {s['day']}: {pretty}", flush=True)
-
-    return {
-        "ok": True,
-        "day": s["day"],
-        "times": s["times"],
-        "rolled_at": s.get("rolled_at"),
-    }
+async def cron_daily_roll():
+    return await daily_roll()
 
 
 @app.get("/api/settings")
 async def get_settings():
-    key = get_buffer_key()
+    s = await load_state_from_db()
+    key = get_buffer_key(s)
     return {
         "has_key": bool(key),
         "preview": (key[:6] + "…" + key[-4:]) if len(key) > 12 else ("set" if key else ""),
@@ -214,7 +158,6 @@ async def set_buffer_key(data: BufferKeyInput):
     key = data.api_key.strip()
     if not key:
         return JSONResponse({"ok": False, "error": "empty key"}, status_code=400)
-
     try:
         email = await key_check(key)
     except BufferError as e:
@@ -222,48 +165,32 @@ async def set_buffer_key(data: BufferKeyInput):
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-    s = load_state()
+    s = await load_state_from_db()
     s["buffer_api_key"] = key
-    save_state(s)
-    await persist_now()
+    await persist(s)
     return {"ok": True, "email": email}
 
 
 @app.delete("/api/settings/buffer-key")
 async def clear_buffer_key():
-    s = load_state()
+    s = await load_state_from_db()
     s.pop("buffer_api_key", None)
-    save_state(s)
-    await persist_now()
+    await persist(s)
     return {"ok": True}
 
 
 @app.get("/api/slots")
 async def slots(count: int = 10):
-    return {"slots": upcoming_slots(count)}
-
-
-@app.get("/api/slots/today")
-async def slots_today():
-    from worker import today_slots_utc, utc_iso, nairobi_iso, fmt_12h
-    from zoneinfo import ZoneInfo
-    nai = ZoneInfo("Africa/Nairobi")
-    out = []
-    for s in today_slots_utc():
-        out.append({
-            "utc": utc_iso(s),
-            "nairobi": nairobi_iso(s),
-            "time12": fmt_12h(s),
-            "label": s.astimezone(nai).strftime("%a %d %b") + " · " + fmt_12h(s),
-        })
-    return {"slots": out}
+    s = await load_state_from_db()
+    return {"slots": upcoming_slots(s, count)}
 
 
 @app.post("/api/slots/reroll")
 async def slots_reroll():
-    s = reroll_slots_today()
-    await persist_now()
-    return {"ok": True, "slots": s}
+    s = await load_state_from_db()
+    slots = reroll_slots_today(s)
+    await persist(s)
+    return {"ok": True, "slots": slots}
 
 
 @app.get("/api/random-slot")
@@ -278,7 +205,7 @@ async def create_pipeline(data: PipelineInput):
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-    s = load_state()
+    state = await load_state_from_db()
     pid = str(uuid.uuid4())
     p = {
         "id": pid,
@@ -300,18 +227,8 @@ async def create_pipeline(data: PipelineInput):
         "log": [],
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
-    s["pipelines"].append(p)
-    save_state(s)
-    await persist_now()
-
-    try:
-        p["upcoming_slots"] = upcoming_slots_for_pipeline(
-            p, min(10, len(p["urls"]) * 2))
-        save_state(s)
-        await persist_now()
-    except Exception:
-        pass
-
+    state["pipelines"].append(p)
+    await persist(state)
     return {"ok": True, "pipeline": p}
 
 
@@ -322,74 +239,95 @@ async def update_pipeline_route(pid: str, data: PipelineInput):
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-    p = update_pipeline(
-        pid,
-        name=data.name.strip() or "Untitled pipeline",
-        channel_id=data.channel_id,
-        tweet_template=data.tweet_template,
-        urls=[u.strip() for u in data.urls if u.strip()],
-        schedule_mode=mode,
-        manual_slot1=s1,
-        manual_slot2=s2,
-    )
+    state = await load_state_from_db()
+    p = find_pipeline_in(state, pid)
     if not p:
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    try:
-        p["upcoming_slots"] = upcoming_slots_for_pipeline(
-            p, min(10, len(p.get("urls") or []) * 2))
-    except Exception:
-        p["upcoming_slots"] = []
-    save_state(load_state())
-    await persist_now()
+    p["name"] = data.name.strip() or "Untitled pipeline"
+    p["channel_id"] = data.channel_id
+    p["tweet_template"] = data.tweet_template
+    p["urls"] = [u.strip() for u in data.urls if u.strip()]
+    p["schedule_mode"] = mode
+    p["manual_slot1"] = s1
+    p["manual_slot2"] = s2
+
+    if p.get("status") in ("scheduled", "running"):
+        try:
+            p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
+            p["next_slot"] = utc_iso(next_slot_after_pipeline(p, state, now_utc()))
+        except Exception:
+            pass
+
+    await persist(state)
     return {"ok": True, "pipeline": p}
 
 
 @app.delete("/api/pipelines/{pid}")
 async def delete_pipeline(pid: str):
-    s = load_state()
-    s["pipelines"] = [p for p in s["pipelines"] if p["id"] != pid]
-    save_state(s)
-    await persist_now()
+    state = await load_state_from_db()
+    state["pipelines"] = [p for p in state["pipelines"] if p["id"] != pid]
+    await persist(state)
     return {"ok": True}
 
 
 @app.post("/api/pipelines/{pid}/start")
 async def pipeline_start(pid: str):
-    if not find_pipeline(pid):
+    state = await load_state_from_db()
+    p = find_pipeline_in(state, pid)
+    if not p:
         return JSONResponse({"error": "not found"}, status_code=404)
-    ok = start_pipeline(pid)
-    return {"ok": ok}
+
+    try:
+        nxt = next_slot_after_pipeline(p, state, now_utc())
+    except Exception as e:
+        return JSONResponse({"error": f"cannot compute slot: {e}"}, status_code=400)
+
+    p["status"] = "scheduled"
+    p["current"] = None
+    p["next_slot"] = utc_iso(nxt)
+    p["next_slot_nairobi"] = nairobi_iso(nxt)
+    p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
+
+    await persist(state)
+    return {"ok": True, "next_slot": utc_iso(nxt)}
 
 
 @app.post("/api/pipelines/{pid}/stop")
 async def pipeline_stop(pid: str):
-    ok = stop_pipeline(pid)
-    return {"ok": ok}
+    state = await load_state_from_db()
+    p = find_pipeline_in(state, pid)
+    if not p:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    p["status"] = "stopped"
+    p["current"] = None
+    p["next_slot"] = None
+    await persist(state)
+    return {"ok": True}
 
 
 @app.post("/api/pipelines/{pid}/reset")
 async def pipeline_reset(pid: str):
-    p = update_pipeline(
-        pid,
-        cursor=0,
-        posted_count=0,
-        failed_count=0,
-        status="idle",
-        next_slot=None,
-        next_slot_nairobi=None,
-        current=None,
-        upcoming_slots=[],
-    )
+    state = await load_state_from_db()
+    p = find_pipeline_in(state, pid)
     if not p:
         return JSONResponse({"error": "not found"}, status_code=404)
-    await persist_now()
+    p["cursor"] = 0
+    p["posted_count"] = 0
+    p["failed_count"] = 0
+    p["status"] = "idle"
+    p["next_slot"] = None
+    p["next_slot_nairobi"] = None
+    p["current"] = None
+    p["upcoming_slots"] = []
+    await persist(state)
     return {"ok": True}
 
 
 @app.get("/api/channels")
 async def channels():
-    key = get_buffer_key()
+    s = await load_state_from_db()
+    key = get_buffer_key(s)
     if not key:
         return JSONResponse({"error": "No Buffer API key set"}, status_code=400)
     try:
@@ -407,7 +345,6 @@ async def upload_json(file: UploadFile = File(...)):
 
     if not file.filename or not file.filename.lower().endswith(".json"):
         return JSONResponse({"ok": False, "error": "Only .json"}, status_code=400)
-
     try:
         raw = await file.read()
         data = _json.loads(raw.decode("utf-8"))

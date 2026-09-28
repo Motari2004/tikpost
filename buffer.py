@@ -17,10 +17,8 @@ async def _graphql(query: str, variables: dict, key: str) -> dict:
     }
     payload = {"query": query, "variables": variables or {}}
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(BUFFER_API, json=payload, headers=headers)
-
-    print(f"[Buffer] status={r.status_code} body={r.text[:400]}", flush=True)
 
     try:
         data = r.json()

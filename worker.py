@@ -1,9 +1,8 @@
 import asyncio
-import json
+import hashlib
 import os
 import random
 from datetime import datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -14,8 +13,8 @@ from db import read_state, write_state
 API_BASE     = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
 API_KEY      = os.getenv("API_KEY", "")
 MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))
-POST_RETRIES = int(os.getenv("BUFFER_RETRY_MAX", "3"))
-POST_BACKOFF = float(os.getenv("BUFFER_RETRY_DELAY", "10"))
+POST_RETRIES = int(os.getenv("BUFFER_RETRY_MAX", "2"))
+POST_BACKOFF = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
 
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
@@ -29,46 +28,17 @@ MIN_GAP_MIN   = 120
 # ==================================================================
 # State
 # ==================================================================
-_STATE: dict = {
-    "pipelines": [],
-    "slots": {"day": None, "times": []},
-    "buffer_api_key": "",
-}
-_STATE_LOCK = asyncio.Lock()
-
-
 def _default_state() -> dict:
     return {
         "pipelines": [],
         "slots": {"day": None, "times": []},
         "buffer_api_key": "",
+        "last_tick": None,
+        "tick_count": 0,
     }
 
 
-def load_state() -> dict:
-    return _STATE
-
-
-def save_state(state: dict) -> None:
-    global _STATE
-    _STATE = state
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_flush_state(state))
-    except RuntimeError:
-        pass
-
-
-async def _flush_state(state: dict) -> None:
-    async with _STATE_LOCK:
-        try:
-            await write_state(state)
-        except Exception as e:
-            print(f"[db] write_state failed: {e}", flush=True)
-
-
 async def load_state_from_db() -> dict:
-    global _STATE
     try:
         data = await read_state()
     except Exception as e:
@@ -81,13 +51,16 @@ async def load_state_from_db() -> dict:
     data.setdefault("pipelines", [])
     data.setdefault("slots", {"day": None, "times": []})
     data.setdefault("buffer_api_key", "")
+    data.setdefault("last_tick", None)
+    data.setdefault("tick_count", 0)
+    return data
 
-    _STATE = data
-    return _STATE
 
-
-async def persist_now() -> None:
-    await _flush_state(_STATE)
+async def persist(state: dict) -> None:
+    try:
+        await write_state(state)
+    except Exception as e:
+        print(f"[db] write_state failed: {e}", flush=True)
 
 
 # ==================================================================
@@ -137,15 +110,7 @@ def _validate_hhmm(t: str) -> str:
 
 
 # ==================================================================
-# Buffer key
-# ==================================================================
-def get_buffer_key() -> str:
-    s = _STATE
-    return (s.get("buffer_api_key") or os.getenv("BUFFER_API_KEY", "")).strip()
-
-
-# ==================================================================
-# Random slots
+# Slots
 # ==================================================================
 def _roll_slots_for(day) -> list[str]:
     start_min = _minutes(*WINDOW_START)
@@ -176,30 +141,25 @@ def _roll_slots_for(day) -> list[str]:
     return sorted(out)
 
 
-def ensure_slots_for_today() -> dict:
-    s = _STATE
-    slots = s.setdefault("slots", {"day": None, "times": []})
+def ensure_slots_for_today(state: dict) -> dict:
+    slots = state.setdefault("slots", {"day": None, "times": []})
     today = _today_local_str()
 
     if slots.get("day") != today or not slots.get("times"):
         slots["day"] = today
         slots["times"] = _roll_slots_for(now_utc().astimezone(NAIROBI).date())
         slots["rolled_at"] = now_utc().isoformat()
-        save_state(s)
-        pretty = ", ".join(_hhmm_to_12h(t) for t in slots["times"])
-        print(f"[slots] rolled new slots for {today}: {pretty}", flush=True)
+        print(f"[slots] rolled new slots for {today}: {slots['times']}", flush=True)
 
     return slots
 
 
-def reroll_slots_today() -> dict:
-    s = _STATE
-    slots = s.setdefault("slots", {})
+def reroll_slots_today(state: dict) -> dict:
+    slots = state.setdefault("slots", {})
     today = _today_local_str()
     slots["day"] = today
     slots["times"] = _roll_slots_for(now_utc().astimezone(NAIROBI).date())
     slots["rolled_at"] = now_utc().isoformat()
-    save_state(s)
     return slots
 
 
@@ -208,66 +168,67 @@ def _parse_hhmm_on(day, hhmm: str) -> datetime:
     return datetime(day.year, day.month, day.day, int(h), int(m), tzinfo=NAIROBI)
 
 
-def today_slots_utc() -> list[datetime]:
-    slots = ensure_slots_for_today()
-    day = now_utc().astimezone(NAIROBI).date()
-    return [_parse_hhmm_on(day, t).astimezone(UTC) for t in slots["times"]]
-
-
-def _times_for_pipeline(p: dict) -> list[str]:
-    """Two times: manual uses slot1 + slot2 as-set; random uses today's roll."""
+def _times_for_pipeline(p: dict, state: dict) -> list[str]:
     mode = (p.get("schedule_mode") or "random").lower()
     if mode == "manual":
         s1 = _validate_hhmm(p.get("manual_slot1") or "09:00")
         s2 = _validate_hhmm(p.get("manual_slot2") or "13:00")
         return sorted([s1, s2])
-    return ensure_slots_for_today()["times"]
+    return ensure_slots_for_today(state)["times"]
 
 
-def daily_slots_for_pipeline(p: dict, day) -> list[datetime]:
-    today_local = now_utc().astimezone(NAIROBI).date()
+def _slots_for_day(p: dict, state: dict, day) -> list[datetime]:
     mode = (p.get("schedule_mode") or "random").lower()
+    today_local = now_utc().astimezone(NAIROBI).date()
 
     if mode == "manual":
-        return [_parse_hhmm_on(day, t).astimezone(UTC) for t in _times_for_pipeline(p)]
+        return [_parse_hhmm_on(day, t).astimezone(UTC)
+                for t in _times_for_pipeline(p, state)]
 
     if day == today_local:
-        return today_slots_utc()
+        times = ensure_slots_for_today(state)["times"]
+        return [_parse_hhmm_on(day, t).astimezone(UTC) for t in times]
 
-    key = day.isoformat()
-    cached = _FUTURE_CACHE.get(key)
-    if cached is None:
-        cached = [
-            _parse_hhmm_on(day, t).astimezone(UTC)
-            for t in _roll_slots_for(day)
-        ]
-        _FUTURE_CACHE[key] = cached
-        if len(_FUTURE_CACHE) > 4:
-            for old in sorted(_FUTURE_CACHE.keys())[:-4]:
-                _FUTURE_CACHE.pop(old, None)
-    return cached
+    # Deterministic per-day roll for future days — stable preview
+    seed = int(hashlib.sha256(day.isoformat().encode()).hexdigest()[:8], 16)
+    rnd = random.Random(seed)
+    start_min = _minutes(*WINDOW_START)
+    end_min   = _minutes(*WINDOW_END)
+    span      = end_min - start_min
+
+    for _ in range(300):
+        offs = sorted(rnd.sample(range(span + 1), POSTS_PER_DAY))
+        if all(offs[i + 1] - offs[i] >= MIN_GAP_MIN for i in range(len(offs) - 1)):
+            break
+    else:
+        offs = [int(round(span * i / (POSTS_PER_DAY + 1)))
+                for i in range(1, POSTS_PER_DAY + 1)]
+
+    out = []
+    for off in offs:
+        total = start_min + off
+        h, m = divmod(total, 60)
+        out.append(_parse_hhmm_on(day, f"{h:02d}:{m:02d}").astimezone(UTC))
+    return sorted(out)
 
 
-_FUTURE_CACHE: dict[str, list[datetime]] = {}
-
-
-def next_slot_after_pipeline(p: dict, after_utc: datetime) -> datetime:
+def next_slot_after_pipeline(p: dict, state: dict, after_utc: datetime) -> datetime:
     local = after_utc.astimezone(NAIROBI)
     for day_offset in range(8):
         day = (local + timedelta(days=day_offset)).date()
-        for slot_local_utc in daily_slots_for_pipeline(p, day):
-            if slot_local_utc > after_utc:
-                return slot_local_utc
+        for s in _slots_for_day(p, state, day):
+            if s > after_utc:
+                return s
     raise RuntimeError("no slot found in 8 days")
 
 
-def upcoming_slots_for_pipeline(p: dict, count: int,
+def upcoming_slots_for_pipeline(p: dict, state: dict, count: int,
                                 after_utc: datetime | None = None) -> list[dict]:
     after = after_utc or now_utc()
     out = []
     cursor = after
     for _ in range(count):
-        s = next_slot_after_pipeline(p, cursor)
+        s = next_slot_after_pipeline(p, state, cursor)
         local = s.astimezone(NAIROBI)
         out.append({
             "utc": utc_iso(s),
@@ -279,42 +240,13 @@ def upcoming_slots_for_pipeline(p: dict, count: int,
     return out
 
 
-def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
-    after = after_utc or now_utc()
-    out = []
-    cursor = after
-    for _ in range(count):
-        local_dt = cursor.astimezone(NAIROBI)
-        day = local_dt.date()
-        candidates = today_slots_utc() if day == local_dt.date() else [
-            _parse_hhmm_on(day, t).astimezone(UTC) for t in _roll_slots_for(day)
-        ]
-        chosen = next((s for s in candidates if s > cursor), None)
-        if chosen is None:
-            for d_offset in range(1, 8):
-                day2 = (local_dt + timedelta(days=d_offset)).date()
-                candidates = [
-                    _parse_hhmm_on(day2, t).astimezone(UTC)
-                    for t in _roll_slots_for(day2)
-                ]
-                chosen = next((s for s in candidates if s > cursor), None)
-                if chosen:
-                    break
-        if chosen is None:
-            raise RuntimeError("no slot found")
-        local = chosen.astimezone(NAIROBI)
-        out.append({
-            "utc": utc_iso(chosen),
-            "nairobi": nairobi_iso(chosen),
-            "label": local.strftime("%a %d %b") + " · " + fmt_12h(local),
-            "time12": fmt_12h(local),
-        })
-        cursor = chosen + timedelta(seconds=1)
-    return out
+def upcoming_slots(state: dict, count: int,
+                   after_utc: datetime | None = None) -> list[dict]:
+    fake = {"schedule_mode": "random"}
+    return upcoming_slots_for_pipeline(fake, state, count, after_utc)
 
 
 def roll_one_slot(exclude: str | None = None) -> str:
-    """Roll a single random time inside the window, optionally excluding a time."""
     start_min = _minutes(*WINDOW_START)
     end_min   = _minutes(*WINDOW_END)
     span      = end_min - start_min
@@ -332,29 +264,16 @@ def roll_one_slot(exclude: str | None = None) -> str:
 
 
 # ==================================================================
-# Pipeline helpers
+# Key
 # ==================================================================
-def find_pipeline(pid: str) -> dict | None:
-    for p in _STATE.get("pipelines", []):
-        if p["id"] == pid:
-            return p
-    return None
-
-
-def update_pipeline(pid: str, **fields) -> dict | None:
-    s = _STATE
-    for p in s.get("pipelines", []):
-        if p["id"] == pid:
-            p.update(fields)
-            save_state(s)
-            return p
-    return None
+def get_buffer_key(state: dict) -> str:
+    return (state.get("buffer_api_key") or os.getenv("BUFFER_API_KEY", "")).strip()
 
 
 # ==================================================================
-# HTTP stages
+# Stages
 # ==================================================================
-async def resolve(client, url, log) -> dict | None:
+async def resolve(client, url: str) -> dict | None:
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["X-API-Key"] = API_KEY
@@ -363,270 +282,220 @@ async def resolve(client, url, log) -> dict | None:
         try:
             r = await client.post(
                 f"{API_BASE}/api/v1/resolve",
-                json={"url": url}, headers=headers, timeout=120,
+                json={"url": url}, headers=headers, timeout=20,
             )
             if r.status_code == 200 and r.json().get("status") == "ok":
                 return r.json()
-            log(f"resolve {attempt}: HTTP {r.status_code}")
+            print(f"[resolve] {attempt}: HTTP {r.status_code}", flush=True)
         except Exception as e:
-            log(f"resolve {attempt}: {e}")
-        await asyncio.sleep(5 * attempt)
+            print(f"[resolve] {attempt}: {e}", flush=True)
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(1.5 * attempt)
     return None
 
 
-async def post(video_url: str, source_url: str,
-               channel_id: str, template: str, log) -> bool:
+async def post_to_buffer(state: dict, video_url: str, source_url: str,
+                         channel_id: str, template: str) -> bool:
     text = template.replace("{source_url}", source_url).strip()[:2200]
-    key = get_buffer_key()
+    key = get_buffer_key(state)
 
     if not key:
-        log("❌ no Buffer API key — set it in ⚙ Settings")
         return False
-
-    log(f"🎬 TikTok video URL: {video_url[:90]}...")
 
     for attempt in range(1, POST_RETRIES + 1):
         try:
-            result = await create_post(
+            await create_post(
                 key=key,
                 channel_id=channel_id,
                 text=text,
                 video_url=video_url,
                 mode="shareNow",
             )
-            pid = (result.get("id") or "?")[:8]
-            log(f"✅ published id={pid}... status={result.get('status')}")
             return True
         except BufferError as e:
-            log(f"⚠ post {attempt}/{POST_RETRIES}: {e}")
+            print(f"[post] {attempt}/{POST_RETRIES}: {e}", flush=True)
         except Exception as e:
-            log(f"⚠ post {attempt}/{POST_RETRIES}: {e}")
+            print(f"[post] {attempt}/{POST_RETRIES}: {e}", flush=True)
         if attempt < POST_RETRIES:
             await asyncio.sleep(POST_BACKOFF * attempt)
     return False
 
 
 # ==================================================================
-# Runner
+# Fire one pipeline
 # ==================================================================
-class PipelineRunner:
-    def __init__(self, pid: str):
-        self.pid = pid
-        self.cancel = False
-        self.task: asyncio.Task | None = None
-        self.current: dict | None = None
-        self.next_slot: str | None = None
+def _log(state: dict, pid: str, msg: str):
+    line = f"{datetime.now(NAIROBI).strftime('%I:%M:%S %p').lstrip('0')} {msg}"
+    print(f"[{pid[:8]}] {line}", flush=True)
+    for p in state.get("pipelines", []):
+        if p["id"] == pid:
+            p.setdefault("log", []).append(line)
+            p["log"] = p["log"][-200:]
+            break
 
-    def log(self, msg: str):
-        line = f"{datetime.now(NAIROBI).strftime('%I:%M:%S %p').lstrip('0')} {msg}"
-        print(f"[{self.pid[:8]}] {line}", flush=True)
-        s = _STATE
-        for p in s.get("pipelines", []):
-            if p["id"] == self.pid:
-                p.setdefault("log", []).append(line)
-                p["log"] = p["log"][-200:]
-                break
-        save_state(s)
 
-    async def _sleep_until(self, target: datetime):
-        while not self.cancel:
-            remaining = (target - now_utc()).total_seconds()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(2, remaining))
+async def fire_one(state: dict, p: dict) -> dict:
+    pid = p["id"]
+    urls = p.get("urls") or []
+    cursor = int(p.get("cursor") or 0)
 
-    async def run(self):
-        p = find_pipeline(self.pid)
-        if not p:
-            return
+    if cursor >= len(urls):
+        p["status"] = "done"
+        p["next_slot"] = None
+        _log(state, pid, "🏁 no more URLs")
+        return {"pipeline": pid, "fired": False, "reason": "queue_empty"}
 
-        update_pipeline(self.pid, status="scheduled")
+    channel_id = p.get("channel_id", "")
+    template = p.get("tweet_template", "")
+    source_url = urls[cursor]
 
-        urls       = p.get("urls") or []
-        channel_id = p.get("channel_id", "")
-        template   = p.get("tweet_template", "")
-        mode       = (p.get("schedule_mode") or "random").lower()
+    _log(state, pid, f"▶ [{cursor+1}/{len(urls)}] {source_url}")
+    p["current"] = {"stage": "resolve", "url": source_url}
+    p["status"] = "running"
 
-        if not channel_id:
-            self.log("❌ no channel selected")
-            update_pipeline(self.pid, status="failed")
-            return
-        if not urls:
-            self.log("❌ no URLs in pipeline")
-            update_pipeline(self.pid, status="failed")
-            return
-        if not get_buffer_key():
-            self.log("❌ no Buffer API key — set it in ⚙ Settings")
-            update_pipeline(self.pid, status="failed")
-            return
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        result = await resolve(client, source_url)
 
-        if mode == "manual":
-            times = _times_for_pipeline(p)
-            pretty = ", ".join(_hhmm_to_12h(t) for t in times)
-            self.log(f"🗓 schedule: manual · {pretty} (Nairobi)")
+    if not result:
+        _log(state, pid, "❌ resolve failed")
+        p["cursor"] = cursor + 1
+        p["failed_count"] = int(p.get("failed_count") or 0) + 1
+        p["current"] = None
+        if p["cursor"] >= len(urls):
+            p["status"] = "done"
+            p["next_slot"] = None
         else:
-            ensure_slots_for_today()
-            slots_today = _STATE["slots"]["times"]
-            pretty = ", ".join(_hhmm_to_12h(t) for t in slots_today)
-            self.log(f"🗓 schedule: random · today: {pretty} (Nairobi)")
+            nxt = next_slot_after_pipeline(p, state, now_utc())
+            p["status"] = "scheduled"
+            p["next_slot"] = utc_iso(nxt)
+            p["next_slot_nairobi"] = nairobi_iso(nxt)
+        return {"pipeline": pid, "fired": True, "success": False,
+                "reason": "resolve_failed"}
 
-        preview = upcoming_slots_for_pipeline(p, min(10, len(urls) * 2))
-        update_pipeline(self.pid, upcoming_slots=preview)
-        self.log("   upcoming slots:")
-        for i, slot in enumerate(preview, 1):
-            self.log(f"     {i:2d}. {slot['label']} (Nairobi)")
+    video_url = result["download_url"]
+    filename = result.get("filename", "video.mp4")
+    _log(state, pid, f"✅ resolved → {filename}")
+    p["current"] = {"stage": "post", "filename": filename}
 
-        posted = failed = 0
-        slot_index = 0
+    ok = await post_to_buffer(state, video_url, source_url, channel_id, template)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            while slot_index < len(urls) and not self.cancel:
-                p = find_pipeline(self.pid)
-                slot_time = next_slot_after_pipeline(p, now_utc())
-                nairobi_time = slot_time.astimezone(NAIROBI)
-                nai_12h = fmt_12h(nairobi_time)
+    p["cursor"] = cursor + 1
+    p["posted_count"] = int(p.get("posted_count") or 0) + (1 if ok else 0)
+    p["failed_count"] = int(p.get("failed_count") or 0) + (0 if ok else 1)
+    p["current"] = None
 
-                self.next_slot = utc_iso(slot_time)
-                update_pipeline(
-                    self.pid,
-                    next_slot=self.next_slot,
-                    next_slot_nairobi=nairobi_iso(slot_time),
-                    upcoming_slots=upcoming_slots_for_pipeline(
-                        p, min(10, len(urls) * 2)),
-                )
+    if p["cursor"] >= len(urls):
+        p["status"] = "done"
+        p["next_slot"] = None
+        p["upcoming_slots"] = []
+        _log(state, pid,
+             f"🏁 done posted={p['posted_count']} failed={p['failed_count']}")
+    else:
+        nxt = next_slot_after_pipeline(p, state, now_utc())
+        p["status"] = "scheduled"
+        p["next_slot"] = utc_iso(nxt)
+        p["next_slot_nairobi"] = nairobi_iso(nxt)
+        p["upcoming_slots"] = upcoming_slots_for_pipeline(
+            p, state, min(10, (len(urls) - p["cursor"]) * 2))
 
-                wait_sec = (slot_time - now_utc()).total_seconds()
-                self.log(
-                    f"⏳ slot #{slot_index+1} → "
-                    f"{nairobi_time.strftime('%a %d %b')} · {nai_12h} (Nairobi) "
-                    f"· in {wait_sec/3600:.2f}h"
-                )
-
-                await self._sleep_until(slot_time)
-                if self.cancel:
-                    break
-
-                source_url = urls[slot_index]
-                self.current = {"stage": "resolve", "url": source_url}
-                update_pipeline(self.pid, current=dict(self.current))
-                self.log(f"▶ [{slot_index+1}/{len(urls)}] {source_url}")
-
-                result = await resolve(client, source_url, self.log)
-                if not result:
-                    self.log("❌ resolve failed")
-                    failed += 1
-                    slot_index += 1
-                    update_pipeline(
-                        self.pid,
-                        cursor=slot_index,
-                        failed_count=failed,
-                        current=None,
-                        upcoming_slots=upcoming_slots_for_pipeline(
-                            p, min(10, len(urls) * 2)),
-                    )
-                    continue
-
-                video_url = result["download_url"]
-                filename  = result.get("filename", "video.mp4")
-
-                self.current = {"stage": "post", "filename": filename}
-                update_pipeline(self.pid, current=dict(self.current))
-                self.log(f"✅ resolved → {filename}")
-
-                if await post(video_url, source_url, channel_id, template, self.log):
-                    posted += 1
-                    self.log(f"✅ posted {filename}")
-                else:
-                    failed += 1
-                    self.log(f"❌ failed {filename}")
-
-                slot_index += 1
-                update_pipeline(
-                    self.pid,
-                    cursor=slot_index,
-                    posted_count=posted,
-                    failed_count=failed,
-                    current=None,
-                    upcoming_slots=upcoming_slots_for_pipeline(
-                        p, min(10, len(urls) * 2)),
-                )
-
-        status = "stopped" if self.cancel else "done"
-        update_pipeline(
-            self.pid,
-            status=status,
-            next_slot=None,
-            next_slot_nairobi=None,
-            current=None,
-            posted_count=posted,
-            failed_count=failed,
-            cursor=slot_index,
-        )
-        self.log(f"🏁 {status} posted={posted} failed={failed}")
-
-
-runners: dict[str, PipelineRunner] = {}
-
-
-def start_pipeline(pid: str) -> bool:
-    if pid in runners and runners[pid].task and not runners[pid].task.done():
-        return False
-    r = PipelineRunner(pid)
-    runners[pid] = r
-    r.task = asyncio.create_task(r.run())
-    return True
-
-
-def stop_pipeline(pid: str) -> bool:
-    r = runners.get(pid)
-    if not r:
-        return False
-    r.cancel = True
-    return True
-
-
-def is_running(pid: str) -> bool:
-    r = runners.get(pid)
-    return bool(r and r.task and not r.task.done())
+    return {"pipeline": pid, "fired": True, "success": ok, "filename": filename}
 
 
 # ==================================================================
-# Daily re-roll
+# tick — called by cron every minute
 # ==================================================================
-async def daily_reroll_loop():
-    print("[slots] background reroll loop started", flush=True)
-    try:
-        ensure_slots_for_today()
-        await persist_now()
-    except Exception as e:
-        print(f"[slots] initial roll failed: {e}", flush=True)
+async def tick() -> dict:
+    state = await load_state_from_db()
+    state["last_tick"] = now_utc().isoformat()
+    state["tick_count"] = int(state.get("tick_count") or 0) + 1
 
-    while True:
+    now = now_utc()
+    fired = []
+
+    for p in list(state.get("pipelines", [])):
+        if p.get("status") not in ("scheduled", "running"):
+            continue
+
+        if not p.get("next_slot"):
+            try:
+                nxt = next_slot_after_pipeline(p, state, now)
+                p["next_slot"] = utc_iso(nxt)
+                p["next_slot_nairobi"] = nairobi_iso(nxt)
+                p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
+            except Exception as e:
+                print(f"[tick] compute failed {p['id'][:8]}: {e}", flush=True)
+            continue
+
         try:
-            local_now = now_utc().astimezone(NAIROBI)
-            tomorrow = (local_now + timedelta(days=1)).date()
-            midnight = datetime(
-                tomorrow.year, tomorrow.month, tomorrow.day,
-                0, 0, 0, tzinfo=NAIROBI,
-            ).astimezone(UTC)
+            due = datetime.fromisoformat(p["next_slot"].replace("Z", "+00:00"))
+        except Exception:
+            nxt = next_slot_after_pipeline(p, state, now)
+            p["next_slot"] = utc_iso(nxt)
+            p["next_slot_nairobi"] = nairobi_iso(nxt)
+            continue
 
-            wait_sec = (midnight - now_utc()).total_seconds()
-            while wait_sec > 0:
-                await asyncio.sleep(min(60, wait_sec))
-                wait_sec = (midnight - now_utc()).total_seconds()
+        if due > now:
+            continue
 
-            s = _STATE
-            day_str = _today_local_str()
-            slots = s.setdefault("slots", {})
-            if slots.get("day") != day_str or not slots.get("times"):
-                slots["day"] = day_str
-                slots["times"] = _roll_slots_for(now_utc().astimezone(NAIROBI).date())
-                slots["rolled_at"] = now_utc().isoformat()
-                save_state(s)
-                await persist_now()
-                pretty = ", ".join(_hhmm_to_12h(t) for t in slots["times"])
-                print(f"[slots] background rolled new slots for {day_str}: {pretty}",
-                      flush=True)
+        try:
+            r = await fire_one(state, p)
+            fired.append(r)
         except Exception as e:
-            print(f"[slots] reroll loop error: {e}", flush=True)
-            await asyncio.sleep(60)
+            print(f"[tick] fire failed {p['id'][:8]}: {e}", flush=True)
+            _log(state, p["id"], f"❌ fire error: {e}")
+
+    await persist(state)
+
+    return {
+        "ok": True,
+        "fired": fired,
+        "now": utc_iso(now),
+        "tick_count": state["tick_count"],
+    }
+
+
+# ==================================================================
+# daily roll
+# ==================================================================
+async def daily_roll() -> dict:
+    state = await load_state_from_db()
+    slots = state.get("slots", {})
+    today = _today_local_str()
+
+    if slots.get("day") == today and slots.get("times"):
+        return {"ok": True, "already": True, "day": today, "times": slots["times"]}
+
+    s = reroll_slots_today(state)
+
+    for p in state.get("pipelines", []):
+        try:
+            if p.get("status") in ("scheduled", "running"):
+                p["upcoming_slots"] = upcoming_slots_for_pipeline(
+                    p, state, min(10, len(p.get("urls") or []) * 2))
+        except Exception:
+            p["upcoming_slots"] = []
+
+    await persist(state)
+
+    return {
+        "ok": True,
+        "day": s["day"],
+        "times": s["times"],
+        "rolled_at": s.get("rolled_at"),
+    }
+
+
+# ==================================================================
+# Startup
+# ==================================================================
+async def on_startup():
+    state = await load_state_from_db()
+    ensure_slots_for_today(state)
+
+    for p in state.get("pipelines", []):
+        if p.get("status") == "running":
+            p["status"] = "scheduled"
+        if p.get("current"):
+            p["current"] = None
+
+    await persist(state)
