@@ -172,6 +172,7 @@
     }
     .mode-tag.random { background: rgba(74,144,226,0.15); color: var(--accent); }
     .mode-tag.manual { background: rgba(240,165,0,0.15); color: var(--warn); }
+    .mode-tag.caption { background: rgba(240,165,0,0.15); color: var(--warn); }
 
     .status-badge {
       padding: 3px 9px; border-radius: 999px;
@@ -273,8 +274,9 @@
       font-size: 10.5px; font-weight: 600;
       text-transform: uppercase; letter-spacing: 0.04em;
     }
-    .stage.resolve { background: rgba(74,144,226,0.15); color: var(--accent); }
-    .stage.post    { background: rgba(53,196,107,0.15); color: var(--success); }
+    .stage.resolve    { background: rgba(74,144,226,0.15); color: var(--accent); }
+    .stage.transcript { background: rgba(240,165,0,0.15); color: var(--warn); }
+    .stage.post       { background: rgba(53,196,107,0.15); color: var(--success); }
 
     .pipeline-actions {
       display: flex; gap: 6px; flex-wrap: wrap;
@@ -406,6 +408,30 @@
       padding: 8px 12px !important; font-size: 13px !important;
     }
 
+    .checkbox-row {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 14px;
+    }
+    .checkbox-row input[type="checkbox"] { width: auto; }
+    .checkbox-row span { font-size: 13px; color: var(--text); }
+
+    .transcript-opts {
+      margin-top: 10px;
+      padding: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .transcript-opts .row {
+      display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+    }
+    .transcript-opts .row label {
+      margin: 0; font-size: 12px; color: var(--muted);
+    }
+    .transcript-opts input[type="number"] {
+      max-width: 110px; width: 110px;
+    }
+
     .toast {
       position: fixed; bottom: 24px; right: 24px;
       padding: 12px 18px;
@@ -482,10 +508,32 @@
         <button class="ghost small" onclick="loadChannels()" title="Refresh">↻</button>
       </div>
 
-      <label>Caption template</label>
+      <label>Caption template (fallback)</label>
       <textarea id="f-template" placeholder="Check this out 🔥 {source_url} #fyp"></textarea>
       <div class="hint">
         Use <code>{source_url}</code> to inject the TikTok link. Max 2,200 characters.
+        This is used only if the transcript is unavailable.
+      </div>
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="f-use-transcript" checked />
+        <span>Use the video's spoken transcript as the caption</span>
+      </div>
+
+      <div class="transcript-opts" id="f-transcript-opts">
+        <div class="row">
+          <label>Max chars</label>
+          <input type="number" id="f-transcript-max" value="2000"
+                 min="100" max="2200" />
+          <label style="display:flex;align-items:center;gap:6px;margin:0">
+            <input type="checkbox" id="f-append-url" checked />
+            <span style="font-size:12px">Append TikTok URL</span>
+          </label>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          When enabled, the transcript from transcript365 becomes the caption.
+          If empty, the fallback template above is used.
+        </div>
       </div>
 
       <label>Schedule</label>
@@ -830,6 +878,10 @@
         ? `<span class="mode-tag manual">🕐 manual</span>`
         : `<span class="mode-tag random">🎲 random</span>`;
 
+      const capTag = p.use_transcript !== false
+        ? `<span class="mode-tag caption">🎤 transcript</span>`
+        : `<span class="mode-tag">✏️ template</span>`;
+
       let modeMeta;
       if (mode === 'manual') {
         const s1 = p.manual_slot1 || '09:00';
@@ -892,6 +944,7 @@
               <span class="dot-sep">·</span>
               <span>${modeMeta}</span>
               ${modeTag}
+              ${capTag}
             </div>
           </div>
           <span class="status-badge ${st}">${st}</span>
@@ -1010,6 +1063,12 @@
       b.addEventListener('click', () => setScheduleMode(b.dataset.mode));
     });
 
+    function updateTranscriptOptsVisibility() {
+      const on = $('f-use-transcript').checked;
+      $('f-transcript-opts').style.display = on ? 'block' : 'none';
+    }
+    $('f-use-transcript').addEventListener('change', updateTranscriptOptsVisibility);
+
     function openCreateModal() {
       editingId = null;
       $('modal-title').textContent = 'New pipeline';
@@ -1020,7 +1079,11 @@
       $('f-urls').value = '';
       $('f-manual-slot1').value = '09:00';
       $('f-manual-slot2').value = '13:00';
+      $('f-use-transcript').checked = true;
+      $('f-transcript-max').value = 2000;
+      $('f-append-url').checked = true;
       setScheduleMode('random');
+      updateTranscriptOptsVisibility();
       updateUrlCount();
       loadChannels();
       $('modal-backdrop').classList.add('open');
@@ -1037,7 +1100,11 @@
       $('f-urls').value = (p.urls || []).join('\n');
       $('f-manual-slot1').value = p.manual_slot1 || '09:00';
       $('f-manual-slot2').value = p.manual_slot2 || '13:00';
+      $('f-use-transcript').checked = p.use_transcript !== false;
+      $('f-transcript-max').value = p.transcript_max_chars ?? 2000;
+      $('f-append-url').checked = p.append_source_url !== false;
       setScheduleMode(p.schedule_mode || 'random');
+      updateTranscriptOptsVisibility();
       updateUrlCount();
       loadChannels().then(() => { $('f-channel').value = p.channel_id || ''; });
       $('modal-backdrop').classList.add('open');
@@ -1055,12 +1122,17 @@
       const schedule_mode = currentScheduleMode;
       const manual_slot1 = $('f-manual-slot1').value || '09:00';
       const manual_slot2 = $('f-manual-slot2').value || '13:00';
+      const use_transcript = $('f-use-transcript').checked;
+      const transcript_max_chars = parseInt($('f-transcript-max').value || '2000', 10);
+      const append_source_url = $('f-append-url').checked;
 
       if (!channel_id) return toast('Pick a TikTok channel', 'err');
       if (!urls.length) return toast('Add at least one URL', 'err');
 
       const body = JSON.stringify({
         name, channel_id, tweet_template, urls,
+        captions: [], caption_pool: [],
+        use_transcript, transcript_max_chars, append_source_url,
         schedule_mode, manual_slot1, manual_slot2,
       });
       const path = editingId ? `/api/pipelines/${editingId}` : '/api/pipelines';

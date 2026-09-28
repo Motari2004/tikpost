@@ -68,6 +68,7 @@ allow_origins = (
     else [
         "https://tikpost-murex.vercel.app",
         "http://127.0.0.1:8000",
+        "http://127.0.0.1:8001",
         "http://localhost:8000",
     ]
 )
@@ -89,6 +90,11 @@ class PipelineInput(BaseModel):
     channel_id: str
     tweet_template: str
     urls: list[str]
+    captions: list[str] = []
+    caption_pool: list[str] = []
+    use_transcript: bool = True
+    transcript_max_chars: int = 2000
+    append_source_url: bool = True
     schedule_mode: str = "random"
     manual_slot1: str = "09:00"
     manual_slot2: str = "13:00"
@@ -147,9 +153,6 @@ async def status():
     }
 
 
-# ==================================================================
-# CRON 1 — tick (fast, dispatches work, returns)
-# ==================================================================
 @app.get("/api/cron/tick")
 @app.post("/api/cron/tick")
 async def cron_tick():
@@ -182,18 +185,12 @@ async def cron_tick():
     }
 
 
-# ==================================================================
-# CRON 2 — daily-roll
-# ==================================================================
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
 async def cron_daily_roll():
     return await daily_roll()
 
 
-# ==================================================================
-# INTERNAL — work (called by tick, not by cron)
-# ==================================================================
 @app.post("/api/internal/work")
 @app.get("/api/internal/work")
 async def internal_work():
@@ -245,9 +242,6 @@ async def internal_work():
     }
 
 
-# ==================================================================
-# Settings
-# ==================================================================
 @app.get("/api/settings")
 async def get_settings():
     s = await load_state_from_db()
@@ -284,9 +278,6 @@ async def clear_buffer_key():
     return {"ok": True}
 
 
-# ==================================================================
-# Slots
-# ==================================================================
 @app.get("/api/slots")
 async def slots(count: int = 10):
     s = await load_state_from_db()
@@ -295,10 +286,6 @@ async def slots(count: int = 10):
 
 @app.post("/api/slots/reroll")
 async def slots_reroll():
-    """
-    Global reroll — regenerates today's random pair AND updates every
-    active pipeline's next_slot so the UI reflects the new times.
-    """
     state = await load_state_from_db()
     slots = reroll_slots_today(state)
 
@@ -310,12 +297,7 @@ async def slots_reroll():
             updated.append(p["id"])
 
     await persist(state)
-
-    return {
-        "ok": True,
-        "slots": slots,
-        "updated_pipelines": updated,
-    }
+    return {"ok": True, "slots": slots, "updated_pipelines": updated}
 
 
 @app.get("/api/random-slot")
@@ -323,15 +305,8 @@ async def random_slot(exclude: str = ""):
     return {"time": roll_one_slot(exclude or None)}
 
 
-# ==================================================================
-# Per-pipeline reroll
-# ==================================================================
 @app.post("/api/pipelines/{pid}/reroll")
 async def pipeline_reroll(pid: str):
-    """
-    Reroll one pipeline's next slot. Only works for random-mode pipelines
-    (manual pipelines have fixed times).
-    """
     state = await load_state_from_db()
     p = find_pipeline_in(state, pid)
     if not p:
@@ -357,16 +332,12 @@ async def pipeline_reroll(pid: str):
         )
 
     p["next_slot"] = new_slot
-    # Recompute the preview list from the new next_slot
     p["upcoming_slots"] = upcoming_slots_for_pipeline(p, state, 10)
     await persist(state)
 
     return {"ok": True, "next_slot": new_slot}
 
 
-# ==================================================================
-# Pipelines CRUD
-# ==================================================================
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     try:
@@ -382,6 +353,12 @@ async def create_pipeline(data: PipelineInput):
         "channel_id": data.channel_id,
         "tweet_template": data.tweet_template,
         "urls": [u.strip() for u in data.urls if u.strip()],
+        "captions": [c.strip() for c in (data.captions or [])],
+        "caption_pool": [c.strip() for c in (data.caption_pool or []) if c.strip()],
+        "use_transcript": bool(data.use_transcript),
+        "transcript_max_chars": int(data.transcript_max_chars or 2000),
+        "append_source_url": bool(data.append_source_url),
+        "resolved_transcripts": {},
         "schedule_mode": mode,
         "manual_slot1": s1,
         "manual_slot2": s2,
@@ -417,6 +394,11 @@ async def update_pipeline_route(pid: str, data: PipelineInput):
     p["channel_id"] = data.channel_id
     p["tweet_template"] = data.tweet_template
     p["urls"] = [u.strip() for u in data.urls if u.strip()]
+    p["captions"] = [c.strip() for c in (data.captions or [])]
+    p["caption_pool"] = [c.strip() for c in (data.caption_pool or []) if c.strip()]
+    p["use_transcript"] = bool(data.use_transcript)
+    p["transcript_max_chars"] = int(data.transcript_max_chars or 2000)
+    p["append_source_url"] = bool(data.append_source_url)
     p["schedule_mode"] = mode
     p["manual_slot1"] = s1
     p["manual_slot2"] = s2
@@ -489,9 +471,6 @@ async def pipeline_reset(pid: str):
     return {"ok": True}
 
 
-# ==================================================================
-# Channels
-# ==================================================================
 @app.get("/api/channels")
 async def channels():
     s = await load_state_from_db()
@@ -507,9 +486,6 @@ async def channels():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# ==================================================================
-# Upload
-# ==================================================================
 @app.post("/api/upload")
 async def upload_json(file: UploadFile = File(...)):
     import json as _json
@@ -530,10 +506,7 @@ async def upload_json(file: UploadFile = File(...)):
     return {"ok": True, "urls": urls, "count": len(urls)}
 
 
-# ==================================================================
-# Local dev
-# ==================================================================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "8001"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)

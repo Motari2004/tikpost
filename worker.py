@@ -13,6 +13,7 @@ from db import read_state, write_state
 API_BASE        = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
 API_KEY         = os.getenv("API_KEY", "")
 RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "55"))
+TRANSCRIPT_TIMEOUT = float(os.getenv("TRANSCRIPT_TIMEOUT", "90"))
 POST_RETRIES    = int(os.getenv("BUFFER_RETRY_MAX", "1"))
 POST_BACKOFF    = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
 
@@ -265,14 +266,9 @@ def roll_one_slot(exclude: str | None = None) -> str:
 
 
 # ==================================================================
-# Pipeline reroll helpers
+# Pipeline helpers
 # ==================================================================
 def reschedule_pipeline(p: dict, state: dict) -> bool:
-    """
-    Recompute the pipeline's next_slot and upcoming_slots from
-    the current state (respecting its schedule_mode).
-    Returns True on success.
-    """
     try:
         nxt = next_slot_after_pipeline(p, state, now_utc())
         p["next_slot"] = utc_iso(nxt)
@@ -285,16 +281,11 @@ def reschedule_pipeline(p: dict, state: dict) -> bool:
 
 
 def reroll_pipeline_slot(p: dict) -> str | None:
-    """
-    Pick a fresh random time inside the window that is still in the future
-    today (Nairobi). Returns an ISO UTC string, or None if no slot available.
-    """
     now_local = now_utc().astimezone(NAIROBI)
     start_min = _minutes(*WINDOW_START)
     end_min   = _minutes(*WINDOW_END)
     now_min   = now_local.hour * 60 + now_local.minute
 
-    # Any candidate must be > now and leave room for MIN_GAP_MIN
     lower = max(start_min, now_min + 2)
     upper = end_min - MIN_GAP_MIN
     if lower >= upper:
@@ -365,13 +356,125 @@ async def resolve_one(url: str, log) -> dict | None:
 
 
 # ==================================================================
+# Transcript
+# ==================================================================
+async def fetch_transcript(source_url: str, log) -> str | None:
+    """
+    Ask the resolver for the video's transcript.
+    Returns the transcript text, or None on any failure.
+    """
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+
+    log("[transcript] requesting…")
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(TRANSCRIPT_TIMEOUT, connect=15.0),
+        ) as client:
+            r = await client.post(
+                f"{API_BASE}/api/v1/transcript",
+                json={"url": source_url},
+                headers=headers,
+            )
+    except httpx.TimeoutException:
+        log(f"[transcript] timeout after {TRANSCRIPT_TIMEOUT}s")
+        return None
+    except httpx.ConnectError as e:
+        log(f"[transcript] connect error: {e}")
+        return None
+    except Exception as e:
+        log(f"[transcript] {type(e).__name__}: {e}")
+        return None
+
+    try:
+        data = r.json()
+    except Exception as e:
+        log(f"[transcript] bad JSON: {e} (HTTP {r.status_code})")
+        return None
+
+    if data.get("status") == "ok" and data.get("transcript"):
+        text = data["transcript"].strip()
+        log(f"[transcript] {len(text)} chars")
+        return text
+
+    log(f"[transcript] error: {data.get('error', 'unknown')}")
+    return None
+
+
+# ==================================================================
+# Caption builder
+# ==================================================================
+def _apply_tokens(text: str, p: dict, cursor: int, source_url: str) -> str:
+    urls = p.get("urls") or []
+    remaining = max(0, len(urls) - cursor - 1)
+    slot_local = now_utc().astimezone(NAIROBI)
+
+    tokens = {
+        "{source_url}": source_url,
+        "{index}":      str(cursor + 1),
+        "{remaining}":  str(remaining),
+        "{date}":       slot_local.strftime("%Y-%m-%d"),
+        "{time}":       slot_local.strftime("%I:%M %p").lstrip("0"),
+        "{day}":        slot_local.strftime("%A"),
+        "{name}":       p.get("name") or "",
+    }
+    for k, v in tokens.items():
+        text = text.replace(k, v)
+
+    return text.strip()[:2200]
+
+
+def build_caption(p: dict, cursor: int, source_url: str,
+                  transcript: str | None) -> str:
+    """
+    Caption priority:
+      1. Transcript (if use_transcript and non-empty)
+      2. Per-URL caption (if set for this URL)
+      3. Pool (random pick)
+      4. Template
+      5. Fallback: source URL
+    """
+    # 1. transcript
+    if p.get("use_transcript", True) and transcript and transcript.strip():
+        cap = transcript.strip()
+        limit = int(p.get("transcript_max_chars") or 2000)
+        if limit > 0 and len(cap) > limit:
+            cap = cap[:limit].rsplit(" ", 1)[0] + "…"
+        if p.get("append_source_url", True):
+            cap = f"{cap}\n\n{source_url}"
+        return _apply_tokens(cap, p, cursor, source_url)
+
+    # 2. per-URL caption
+    captions = p.get("captions") or []
+    if isinstance(captions, list) and cursor < len(captions):
+        per_url = (captions[cursor] or "").strip()
+        if per_url:
+            return _apply_tokens(per_url, p, cursor, source_url)
+
+    # 3. pool
+    pool = p.get("caption_pool") or []
+    if pool:
+        return _apply_tokens(random.choice(pool), p, cursor, source_url)
+
+    # 4. template
+    template = p.get("tweet_template") or ""
+    if template.strip():
+        return _apply_tokens(template, p, cursor, source_url)
+
+    # 5. fallback
+    return source_url[:280]
+
+
+# ==================================================================
 # Buffer post
 # ==================================================================
-async def post_to_buffer(state: dict, video_url: str, source_url: str,
-                         channel_id: str, template: str, log) -> bool:
-    text = template.replace("{source_url}", source_url).strip()[:2200] or source_url[:280]
+async def post_to_buffer(state: dict, p: dict,
+                         video_url: str, source_url: str,
+                         caption: str, log) -> bool:
     key = get_buffer_key(state)
-
     if not key:
         log("[post] no Buffer API key")
         return False
@@ -380,8 +483,8 @@ async def post_to_buffer(state: dict, video_url: str, source_url: str,
         try:
             result = await create_post(
                 key=key,
-                channel_id=channel_id,
-                text=text,
+                channel_id=p.get("channel_id", ""),
+                text=caption,
                 video_url=video_url,
                 mode="shareNow",
             )
@@ -400,7 +503,7 @@ async def post_to_buffer(state: dict, video_url: str, source_url: str,
 
 
 # ==================================================================
-# Due discovery — marks as pending
+# Due discovery
 # ==================================================================
 def find_due_pipelines(state: dict) -> list[str]:
     now = now_utc()
@@ -440,7 +543,7 @@ def find_due_pipelines(state: dict) -> list[str]:
 
 
 # ==================================================================
-# Fire — actual work
+# Fire one pipeline
 # ==================================================================
 async def fire_one(state: dict, p: dict) -> dict:
     pid = p["id"]
@@ -454,16 +557,14 @@ async def fire_one(state: dict, p: dict) -> dict:
         return {"pipeline": pid, "success": False, "reason": "queue_empty"}
 
     source_url = urls[cursor]
-    channel_id = p.get("channel_id", "")
-    template = p.get("tweet_template", "")
+    log = lambda m: _log(state, pid, m)
 
     _log(state, pid, f"▶ [{cursor+1}/{len(urls)}] {source_url}")
     p["current"] = {"stage": "resolve", "url": source_url}
     p["status"] = "running"
     await persist(state)
 
-    log = lambda m: _log(state, pid, m)
-
+    # ---- 1. resolve ----
     result = await resolve_one(source_url, log)
 
     if not result:
@@ -493,11 +594,31 @@ async def fire_one(state: dict, p: dict) -> dict:
     video_url = result["download_url"]
     filename = result.get("filename", "video.mp4")
     _log(state, pid, f"✅ resolved → {filename}")
+
+    # ---- 2. transcript (the caption) ----
+    transcript = None
+    if p.get("use_transcript", True):
+        # check cache first
+        cached = (p.get("resolved_transcripts") or {}).get(source_url)
+        if cached:
+            transcript = cached
+            log(f"[transcript] cached ({len(cached)} chars)")
+        else:
+            p["current"] = {"stage": "transcript", "filename": filename}
+            await persist(state)
+            transcript = await fetch_transcript(source_url, log)
+            if transcript:
+                p.setdefault("resolved_transcripts", {})[source_url] = transcript
+
+    # ---- 3. build the caption ----
+    caption = build_caption(p, cursor, source_url, transcript)
+    log(f"[caption] {caption[:100]}{'…' if len(caption) > 100 else ''}")
+
+    # ---- 4. post to Buffer ----
     p["current"] = {"stage": "post", "filename": filename}
     await persist(state)
 
-    ok = await post_to_buffer(state, video_url, source_url,
-                              channel_id, template, log)
+    ok = await post_to_buffer(state, p, video_url, source_url, caption, log)
 
     p["cursor"] = cursor + 1
     p["posted_count"] = int(p.get("posted_count") or 0) + (1 if ok else 0)
@@ -551,7 +672,6 @@ async def daily_roll() -> dict:
 
     s = reroll_slots_today(state)
 
-    # Push new slots into every active pipeline
     for p in state.get("pipelines", []):
         if p.get("status") in ("scheduled", "running", "pending"):
             reschedule_pipeline(p, state)
