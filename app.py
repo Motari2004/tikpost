@@ -16,10 +16,11 @@ from db import init_pool, close_pool
 from worker import (
     load_state, save_state, find_pipeline, update_pipeline,
     start_pipeline, stop_pipeline, is_running,
-    upcoming_slots, ensure_slots_for_today, reroll_slots_today,
+    upcoming_slots, upcoming_slots_for_pipeline,
+    ensure_slots_for_today, reroll_slots_today,
     daily_reroll_loop, get_buffer_key,
     load_state_from_db, persist_now,
-    _today_local_str,
+    _today_local_str, _validate_hhmm,
     WINDOW_START, WINDOW_END, POSTS_PER_DAY, MIN_GAP_MIN,
 )
 
@@ -91,6 +92,8 @@ class PipelineInput(BaseModel):
     channel_id: str
     tweet_template: str
     urls: list[str]
+    schedule_mode: str = "random"        # "random" | "manual"
+    manual_times: list[str] = []         # ["HH:MM", ...] when manual
 
 
 class BufferKeyInput(BaseModel):
@@ -108,15 +111,26 @@ def _check_cron_secret(request: Request):
         raise HTTPException(status_code=401, detail="invalid cron secret")
 
 
+def _normalize_schedule(data: PipelineInput) -> tuple[str, list[str]]:
+    mode = (data.schedule_mode or "random").lower()
+    if mode not in ("random", "manual"):
+        mode = "random"
+    if mode == "manual":
+        cleaned = []
+        for t in data.manual_times or []:
+            cleaned.append(_validate_hhmm(t))   # raises ValueError on bad input
+        if not cleaned:
+            raise ValueError("manual mode requires at least one time")
+        return mode, sorted(set(cleaned))
+    return "random", []
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     idx = TEMPLATES / "index.html"
     if idx.exists():
         return idx.read_text(encoding="utf-8")
-    return HTMLResponse(
-        "<h1>tikpost API</h1>"
-        "<p>Frontend is deployed on Vercel. This is the API backend.</p>"
-    )
+    return HTMLResponse("<h1>tikpost API</h1><p>Frontend on Vercel.</p>")
 
 
 @app.get("/healthz")
@@ -161,18 +175,17 @@ async def cron_daily_roll(request: Request):
     today = _today_local_str()
 
     if slots.get("day") == today and slots.get("times"):
-        return {
-            "ok": True,
-            "already": True,
-            "day": today,
-            "times": slots["times"],
-        }
+        return {"ok": True, "already": True, "day": today, "times": slots["times"]}
 
     s = reroll_slots_today()
 
     st = load_state()
     for p in st["pipelines"]:
-        p["upcoming_slots"] = upcoming_slots(min(10, len(p.get("urls") or []) * 2))
+        try:
+            p["upcoming_slots"] = upcoming_slots_for_pipeline(
+                p, min(10, len(p.get("urls") or []) * 2))
+        except Exception:
+            p["upcoming_slots"] = []
     save_state(st)
     await persist_now()
 
@@ -255,6 +268,11 @@ async def slots_reroll():
 
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
+    try:
+        mode, times = _normalize_schedule(data)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
     s = load_state()
     pid = str(uuid.uuid4())
     p = {
@@ -263,6 +281,8 @@ async def create_pipeline(data: PipelineInput):
         "channel_id": data.channel_id,
         "tweet_template": data.tweet_template,
         "urls": [u.strip() for u in data.urls if u.strip()],
+        "schedule_mode": mode,
+        "manual_times": times,
         "cursor": 0,
         "posted_count": 0,
         "failed_count": 0,
@@ -277,20 +297,44 @@ async def create_pipeline(data: PipelineInput):
     s["pipelines"].append(p)
     save_state(s)
     await persist_now()
+
+    # Refresh preview for the new pipeline
+    try:
+        p["upcoming_slots"] = upcoming_slots_for_pipeline(
+            p, min(10, len(p["urls"]) * 2))
+        save_state(s)
+        await persist_now()
+    except Exception:
+        pass
+
     return {"ok": True, "pipeline": p}
 
 
 @app.put("/api/pipelines/{pid}")
 async def update_pipeline_route(pid: str, data: PipelineInput):
+    try:
+        mode, times = _normalize_schedule(data)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
     p = update_pipeline(
         pid,
         name=data.name.strip() or "Untitled pipeline",
         channel_id=data.channel_id,
         tweet_template=data.tweet_template,
         urls=[u.strip() for u in data.urls if u.strip()],
+        schedule_mode=mode,
+        manual_times=times,
     )
     if not p:
         return JSONResponse({"error": "not found"}, status_code=404)
+
+    try:
+        p["upcoming_slots"] = upcoming_slots_for_pipeline(
+            p, min(10, len(p.get("urls") or []) * 2))
+    except Exception:
+        p["upcoming_slots"] = []
+    save_state(load_state())
     await persist_now()
     return {"ok": True, "pipeline": p}
 
