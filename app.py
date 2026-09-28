@@ -21,7 +21,7 @@ from worker import (
     daily_reroll_loop, get_buffer_key,
     load_state_from_db, persist_now,
     _today_local_str, _validate_hhmm,
-    _derive_manual_times,
+    _derive_manual_times, roll_slot_one,
     DEFAULT_MANUAL_GAP_MIN,
     WINDOW_START, WINDOW_END, POSTS_PER_DAY, MIN_GAP_MIN,
 )
@@ -94,8 +94,8 @@ class PipelineInput(BaseModel):
     channel_id: str
     tweet_template: str
     urls: list[str]
-    schedule_mode: str = "random"        # "random" | "manual"
-    manual_first: str = "09:00"          # only used when mode == "manual"
+    schedule_mode: str = "random"
+    manual_first: str = "09:00"
     manual_gap_min: int = DEFAULT_MANUAL_GAP_MIN
 
 
@@ -126,7 +126,6 @@ def _normalize_schedule(data: PipelineInput) -> tuple[str, str, int]:
             gap = MIN_GAP_MIN
         if gap > 12 * 60:
             gap = 12 * 60
-        # sanity check: derived second slot must stay inside a valid day
         _derive_manual_times(first, gap)
         return mode, first, gap
 
@@ -272,6 +271,12 @@ async def slots_reroll():
     s = reroll_slots_today()
     await persist_now()
     return {"ok": True, "slots": s}
+
+
+@app.get("/api/random-slot")
+async def random_slot():
+    """Roll a random slot 1 inside the window. Used by the 🎲 button."""
+    return {"first": roll_slot_one()}
 
 
 @app.post("/api/pipelines")

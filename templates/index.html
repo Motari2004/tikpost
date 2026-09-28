@@ -33,7 +33,6 @@
       margin-right: 10px; vertical-align: middle;
     }
 
-    /* Window strip */
     .window-strip {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -363,7 +362,6 @@
     .dz-link { color: var(--accent); text-decoration: underline; }
     .dz-hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
 
-    /* Segmented control */
     .seg {
       display: inline-flex;
       border: 1px solid var(--border);
@@ -396,6 +394,10 @@
     .manual-row .sym {
       color: var(--muted); font-size: 13px;
       font-family: var(--mono);
+    }
+    .dice-btn {
+      padding: 8px 14px !important;
+      font-size: 13px !important;
     }
 
     .manual-preview {
@@ -457,7 +459,7 @@
         </div>
         <div id="w-today-slots" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">—</div>
       </div>
-      <button class="reroll-btn" onclick="rerollSlots()" title="Force a new random pair for today">🎲 Reroll</button>
+      <button class="reroll-btn" onclick="rerollSlots()" title="Force a new random pair for today">🎲 Reroll today</button>
     </div>
 
     <div class="pipelines" id="pipelines"></div>
@@ -471,12 +473,11 @@
 
   </div>
 
-  <!-- Pipeline modal -->
   <div class="modal-backdrop" id="modal-backdrop">
     <div class="modal">
       <h2 id="modal-title">New pipeline</h2>
       <div class="sub">
-        Two posts per day. Pick random (auto) or set the first slot — the second is derived automatically.
+        Two posts per day. Random picks both. Manual lets you set slot 1 and auto-derives slot 2.
       </div>
 
       <label>Pipeline name</label>
@@ -504,16 +505,17 @@
       </div>
 
       <div id="f-manual-block" style="display:none; margin-top:14px">
-        <label style="margin-top:0">First slot (Nairobi) + gap to second slot</label>
+        <label style="margin-top:0">Slot 1 (Nairobi)</label>
         <div class="manual-row">
           <input type="time" id="f-manual-first" value="09:00" />
+          <button type="button" class="ghost dice-btn" onclick="rollSlotOne()" title="Roll a random slot 1">🎲 Roll</button>
           <span class="sym">+</span>
           <input type="number" id="f-manual-gap" min="120" max="720" step="15" value="240" />
-          <span class="sym">min</span>
+          <span class="sym">min → slot 2</span>
         </div>
         <div class="manual-preview" id="f-manual-preview">—</div>
         <div class="hint">
-          Gap must be between 2 and 12 hours. The second slot = first + gap.
+          🎲 rolls a fresh slot 1 inside 6:00 AM–11:00 PM. Gap must be 120–720 min.
         </div>
       </div>
 
@@ -536,7 +538,6 @@
     </div>
   </div>
 
-  <!-- Settings modal -->
   <div class="modal-backdrop" id="settings-backdrop">
     <div class="modal">
       <h2>Settings</h2>
@@ -576,7 +577,6 @@
       return r.json();
     }
 
-    // ---------- Time helpers ----------
     function to12h(hhmm) {
       if (!hhmm) return '';
       const [hh, mm] = hhmm.split(':').map(Number);
@@ -624,14 +624,12 @@
       })[c]);
     }
 
-    // ---------- State ----------
     let pipelinesCache = [];
     let windowCache = null;
     let slotsTodayCache = { times: [], rolled_at: null };
     let editingId = null;
     let currentScheduleMode = 'random';
 
-    // ---------- Refresh ----------
     async function refresh() {
       try {
         const s = await api('/api/status');
@@ -697,7 +695,6 @@
       }
     }
 
-    // ---------- Pipelines ----------
     function renderPipelines() {
       const wrap = $('pipelines');
       const empty = $('empty');
@@ -923,7 +920,7 @@
       });
       $('f-manual-block').style.display = mode === 'manual' ? 'block' : 'none';
       $('f-schedule-hint').textContent = mode === 'manual'
-        ? 'Manual: you set the first slot. The second is derived from the gap.'
+        ? 'Manual: set slot 1 (or 🎲 roll). Slot 2 = slot 1 + gap.'
         : 'Random: 2 posts/day auto-picked inside 6:00 AM–11:00 PM Nairobi.';
       updateManualPreview();
     }
@@ -935,6 +932,27 @@
       const second = addMinutesHhmm(first, gap);
       $('f-manual-preview').innerHTML =
         `Today's slots: <code>${to12h(first)}</code> and <code>${to12h(second)}</code> (Nairobi)`;
+    }
+
+    function rollSlotOne() {
+      const startMin = 6 * 60;
+      const endMin   = 23 * 60;
+      const span     = endMin - startMin;
+      let gap = parseInt($('f-manual-gap').value || '240', 10);
+      if (isNaN(gap)) gap = 240;
+
+      let chosen = null;
+      for (let i = 0; i < 50; i++) {
+        const total = startMin + Math.floor(Math.random() * (span + 1));
+        if (total + gap <= endMin) { chosen = total; break; }
+      }
+      if (chosen === null) chosen = startMin + Math.floor(span / 3);
+
+      const h = Math.floor(chosen / 60);
+      const m = chosen % 60;
+      const hhmm = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+      $('f-manual-first').value = hhmm;
+      updateManualPreview();
     }
 
     document.querySelectorAll('#f-schedule-mode .seg-btn').forEach(b => {
@@ -955,7 +973,6 @@
       $('f-manual-first').value = '09:00';
       $('f-manual-gap').value = '240';
       setScheduleMode('random');
-      updateManualPreview();
       updateUrlCount();
       loadChannels();
       $('modal-backdrop').classList.add('open');
@@ -973,7 +990,6 @@
       $('f-manual-first').value = p.manual_first || '09:00';
       $('f-manual-gap').value = p.manual_gap_min || 240;
       setScheduleMode(p.schedule_mode || 'random');
-      updateManualPreview();
       updateUrlCount();
       loadChannels().then(() => { $('f-channel').value = p.channel_id || ''; });
       $('modal-backdrop').classList.add('open');
@@ -1189,7 +1205,6 @@
       });
     }, 500);
 
-    // ---------- Close modals on backdrop click ----------
     $('modal-backdrop').addEventListener('click', e => {
       if (e.target.id === 'modal-backdrop') closeModal();
     });
@@ -1197,7 +1212,6 @@
       if (e.target.id === 'settings-backdrop') closeSettingsModal();
     });
 
-    // ---------- Boot ----------
     refresh();
     setInterval(refresh, 2000);
   </script>

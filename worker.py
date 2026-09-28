@@ -138,7 +138,6 @@ def _validate_hhmm(t: str) -> str:
 
 
 def _add_minutes_hhmm(hhmm: str, minutes: int) -> str:
-    """'09:00' + 240 → '13:00' (wraps past midnight if needed)."""
     h, m = hhmm.split(":")
     total = int(h) * 60 + int(m) + minutes
     total %= 24 * 60
@@ -147,10 +146,6 @@ def _add_minutes_hhmm(hhmm: str, minutes: int) -> str:
 
 
 def _derive_manual_times(first_hhmm: str, gap_min: int) -> list[str]:
-    """
-    Given the first slot, produce the full list of HH:MM times for the day.
-    POSTS_PER_DAY=2 → [first, first+gap].
-    """
     first = _validate_hhmm(first_hhmm)
     if POSTS_PER_DAY == 1:
         return [first]
@@ -237,13 +232,11 @@ def today_slots_utc() -> list[datetime]:
 
 
 def _times_for_pipeline(p: dict) -> list[str]:
-    """Return the two HH:MM times this pipeline should use today."""
     mode = (p.get("schedule_mode") or "random").lower()
     if mode == "manual":
         first = p.get("manual_first") or "09:00"
         gap   = int(p.get("manual_gap_min") or DEFAULT_MANUAL_GAP_MIN)
         return _derive_manual_times(first, gap)
-    # random → use today's rolled slots
     return ensure_slots_for_today()["times"]
 
 
@@ -303,7 +296,6 @@ def upcoming_slots_for_pipeline(p: dict, count: int,
 
 
 def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
-    """Global random preview (used on the window strip)."""
     after = after_utc or now_utc()
     out = []
     cursor = after
@@ -335,6 +327,25 @@ def upcoming_slots(count: int, after_utc: datetime | None = None) -> list[dict]:
         })
         cursor = chosen + timedelta(seconds=1)
     return out
+
+
+def roll_slot_one() -> str:
+    """Roll a random slot 1 inside the window, respecting the gap constraint."""
+    start_min = _minutes(*WINDOW_START)
+    end_min   = _minutes(*WINDOW_END)
+    span      = end_min - start_min
+
+    for _ in range(50):
+        offset = random.randint(0, span)
+        total = start_min + offset
+        if total + DEFAULT_MANUAL_GAP_MIN <= end_min:
+            h, m = divmod(total, 60)
+            return f"{h:02d}:{m:02d}"
+
+    # fallback
+    total = start_min + span // 3
+    h, m = divmod(total, 60)
+    return f"{h:02d}:{m:02d}"
 
 
 # ==================================================================
