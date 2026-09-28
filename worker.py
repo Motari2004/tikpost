@@ -13,8 +13,8 @@ from db import read_state, write_state
 API_BASE        = os.getenv("API_BASE", "https://tiktokresolver.onrender.com")
 API_KEY         = os.getenv("API_KEY", "")
 RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "55"))
-POST_TIMEOUT    = float(os.getenv("POST_TIMEOUT", "20"))
 POST_RETRIES    = int(os.getenv("BUFFER_RETRY_MAX", "1"))
+POST_BACKOFF    = float(os.getenv("BUFFER_RETRY_DELAY", "5"))
 
 NAIROBI = ZoneInfo("Africa/Nairobi")
 UTC     = ZoneInfo("UTC")
@@ -23,6 +23,9 @@ WINDOW_START  = (6, 0)
 WINDOW_END    = (23, 0)
 POSTS_PER_DAY = 2
 MIN_GAP_MIN   = 120
+
+# How long a "pending" pipeline can sit before we assume the work endpoint died
+PENDING_STALE_SEC = 300
 
 
 # ==================================================================
@@ -283,18 +286,13 @@ def _log(state: dict, pid: str, msg: str):
 
 
 # ==================================================================
-# Resolve — one shot, no retries
+# Resolve
 # ==================================================================
 async def resolve_one(url: str, log) -> dict | None:
-    """
-    Call the resolver. Exactly like the curl you ran manually.
-    One attempt, generous timeout. Returns the JSON or None.
-    """
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["X-API-Key"] = API_KEY
 
-    payload = {"url": url}
     log(f"[resolve] POST {API_BASE}/api/v1/resolve")
 
     try:
@@ -304,7 +302,7 @@ async def resolve_one(url: str, log) -> dict | None:
         ) as client:
             r = await client.post(
                 f"{API_BASE}/api/v1/resolve",
-                json=payload,
+                json={"url": url},
                 headers=headers,
             )
 
@@ -316,7 +314,6 @@ async def resolve_one(url: str, log) -> dict | None:
         if data.get("status") != "ok":
             log(f"[resolve] non-ok: {str(data)[:160]}")
             return None
-
         return data
 
     except httpx.TimeoutException:
@@ -357,22 +354,23 @@ async def post_to_buffer(state: dict, video_url: str, source_url: str,
             log(f"[post] attempt {attempt}: {type(e).__name__}: {e}")
 
         if attempt < POST_RETRIES:
-            await asyncio.sleep(3 * attempt)
+            await asyncio.sleep(POST_BACKOFF * attempt)
 
     return False
 
 
 # ==================================================================
-# Due discovery
+# Due discovery — marks pipelines as "pending"
 # ==================================================================
 def find_due_pipelines(state: dict) -> list[str]:
     now = now_utc()
     stuck_before = now - timedelta(minutes=5)
+    pending_stale = now - timedelta(seconds=PENDING_STALE_SEC)
     due = []
 
     for p in state.get("pipelines", []):
         status = p.get("status")
-        if status not in ("scheduled", "running"):
+        if status not in ("scheduled", "running", "pending"):
             continue
 
         ns = p.get("next_slot")
@@ -383,19 +381,30 @@ def find_due_pipelines(state: dict) -> list[str]:
         except Exception:
             continue
 
-        # If a "running" pipeline is stuck > 5 min, reset it
+        # A "running" pipeline stuck > 5 min → crashed. Reset.
         if status == "running" and due_at < stuck_before:
             p["status"] = "scheduled"
             p["current"] = None
+            status = "scheduled"
 
-        if due_at <= now:
+        # A "pending" pipeline stuck > 5 min → work died. Reset.
+        if status == "pending" and due_at < pending_stale:
+            p["status"] = "scheduled"
+            p["current"] = None
+            status = "scheduled"
+
+        if due_at <= now and status == "scheduled":
+            p["status"] = "pending"
+            p["pending_since"] = now.isoformat()
             due.append(p["id"])
+        elif due_at <= now and status == "pending":
+            due.append(p["id"])   # already marked
 
     return due
 
 
 # ==================================================================
-# fire_one — the whole job: resolve → post → advance
+# Fire — the actual work
 # ==================================================================
 async def fire_one(state: dict, p: dict) -> dict:
     pid = p["id"]
@@ -417,8 +426,9 @@ async def fire_one(state: dict, p: dict) -> dict:
     p["status"] = "running"
     await persist(state)
 
-    # --- resolve ---
     log = lambda m: _log(state, pid, m)
+
+    # --- resolve ---
     result = await resolve_one(source_url, log)
 
     if not result:
@@ -488,6 +498,9 @@ async def fire_pipeline_by_id(pid: str) -> dict:
     if not p:
         return {"pipeline": pid, "success": False, "reason": "not_found"}
 
+    if p.get("status") not in ("scheduled", "running", "pending"):
+        return {"pipeline": pid, "success": False, "reason": "not_active"}
+
     return await fire_one(state, p)
 
 
@@ -506,7 +519,7 @@ async def daily_roll() -> dict:
 
     for p in state.get("pipelines", []):
         try:
-            if p.get("status") in ("scheduled", "running"):
+            if p.get("status") in ("scheduled", "running", "pending"):
                 p["upcoming_slots"] = upcoming_slots_for_pipeline(
                     p, state, min(10, len(p.get("urls") or []) * 2))
         except Exception:
@@ -531,7 +544,7 @@ async def on_startup():
 
     for p in state.get("pipelines", []):
         if p.get("status") == "running":
-            p["status"] = "scheduled"
+            p["status"] = "pending"   # let work retry
         if p.get("current"):
             p["current"] = None
 
