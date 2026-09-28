@@ -1,11 +1,13 @@
+import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, File, UploadFile
+import httpx
+from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -16,7 +18,8 @@ from worker import (
     load_state_from_db, persist,
     upcoming_slots, upcoming_slots_for_pipeline,
     ensure_slots_for_today, reroll_slots_today,
-    get_buffer_key, tick, daily_roll, roll_one_slot, on_startup,
+    get_buffer_key, daily_roll, roll_one_slot, on_startup,
+    find_due_pipelines, fire_pipeline_by_id,
     next_slot_after_pipeline,
     utc_iso, nairobi_iso, now_utc,
     _validate_hhmm,
@@ -24,6 +27,9 @@ from worker import (
 )
 
 UTC = ZoneInfo("UTC")
+
+# The public URL of this app. Used to fire background follow-up requests.
+SELF_BASE = os.getenv("SELF_BASE", "https://tikpost-murex.vercel.app").rstrip("/")
 
 
 def find_pipeline_in(state: dict, pid: str) -> dict | None:
@@ -68,6 +74,9 @@ app.add_middleware(
 TEMPLATES = Path(__file__).parent / "templates"
 
 
+# ------------------------------------------------------------------
+# Models
+# ------------------------------------------------------------------
 class PipelineInput(BaseModel):
     name: str
     channel_id: str
@@ -93,6 +102,9 @@ def _normalize_schedule(data: PipelineInput) -> tuple[str, str, str]:
     return "random", "09:00", "13:00"
 
 
+# ------------------------------------------------------------------
+# UI + health
+# ------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     idx = TEMPLATES / "index.html"
@@ -106,6 +118,9 @@ async def healthz():
     return {"ok": True}
 
 
+# ------------------------------------------------------------------
+# Status
+# ------------------------------------------------------------------
 @app.get("/api/status")
 async def status():
     s = await load_state_from_db()
@@ -131,18 +146,72 @@ async def status():
     }
 
 
+# ------------------------------------------------------------------
+# CRON: fast tick + background fire
+# ------------------------------------------------------------------
 @app.get("/api/cron/tick")
 @app.post("/api/cron/tick")
-async def cron_tick():
-    return await tick()
+async def cron_tick(background: BackgroundTasks):
+    """
+    Fast tick. Reads state, finds due pipelines, dispatches a background
+    fire request for each, returns 200 immediately.
+
+    The cron never waits for the slow work — that happens in
+    /api/cron/fire/{pid}, which Vercel runs as its own function.
+    """
+    state = await load_state_from_db()
+    state["last_tick"] = now_utc().isoformat()
+    state["tick_count"] = int(state.get("tick_count") or 0) + 1
+
+    due = find_due_pipelines(state)
+    await persist(state)
+
+    for pid in due:
+        background.add_task(_dispatch_fire, pid)
+
+    return {
+        "ok": True,
+        "scheduled": due,
+        "now": utc_iso(now_utc()),
+        "tick_count": state["tick_count"],
+    }
 
 
+async def _dispatch_fire(pid: str):
+    """
+    Send a fire-and-forget request to /api/cron/fire/{pid}.
+    We don't wait for the response — just trigger the invocation.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(f"{SELF_BASE}/api/cron/fire/{pid}")
+    except Exception as e:
+        print(f"[tick] dispatch fire failed for {pid[:8]}: {e}", flush=True)
+
+
+@app.get("/api/cron/fire/{pid}")
+@app.post("/api/cron/fire/{pid}")
+async def cron_fire(pid: str):
+    """
+    Actual work: resolve + post + advance cursor.
+    Runs as its own function invocation with its own timeout budget.
+    """
+    result = await fire_pipeline_by_id(pid)
+    return {"ok": True, "result": result}
+
+
+# ------------------------------------------------------------------
+# CRON: daily roll (00:00 Nairobi)
+# ------------------------------------------------------------------
 @app.get("/api/cron/daily-roll")
 @app.post("/api/cron/daily-roll")
 async def cron_daily_roll():
     return await daily_roll()
 
 
+# ------------------------------------------------------------------
+# Settings
+# ------------------------------------------------------------------
 @app.get("/api/settings")
 async def get_settings():
     s = await load_state_from_db()
@@ -179,6 +248,9 @@ async def clear_buffer_key():
     return {"ok": True}
 
 
+# ------------------------------------------------------------------
+# Slots
+# ------------------------------------------------------------------
 @app.get("/api/slots")
 async def slots(count: int = 10):
     s = await load_state_from_db()
@@ -198,6 +270,9 @@ async def random_slot(exclude: str = ""):
     return {"time": roll_one_slot(exclude or None)}
 
 
+# ------------------------------------------------------------------
+# Pipelines CRUD
+# ------------------------------------------------------------------
 @app.post("/api/pipelines")
 async def create_pipeline(data: PipelineInput):
     try:
@@ -324,6 +399,9 @@ async def pipeline_reset(pid: str):
     return {"ok": True}
 
 
+# ------------------------------------------------------------------
+# Channels
+# ------------------------------------------------------------------
 @app.get("/api/channels")
 async def channels():
     s = await load_state_from_db()
@@ -339,6 +417,9 @@ async def channels():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ------------------------------------------------------------------
+# Upload
+# ------------------------------------------------------------------
 @app.post("/api/upload")
 async def upload_json(file: UploadFile = File(...)):
     import json as _json
@@ -359,6 +440,9 @@ async def upload_json(file: UploadFile = File(...)):
     return {"ok": True, "urls": urls, "count": len(urls)}
 
 
+# ------------------------------------------------------------------
+# Local dev
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
